@@ -4,6 +4,9 @@ const PREF_KEYS = Object.freeze({
   syncMode: "extensions.fastread.viewer.syncMode",
   remoteBaseURL: "extensions.fastread.remote.baseURL",
   remoteApiKey: "extensions.fastread.remote.apiKey",
+  remoteProvider: "extensions.fastread.remote.providerConfigId",
+  remoteModel: "extensions.fastread.remote.model",
+  remoteActiveModelId: "extensions.fastread.remote.activeModelId",
   remoteSourceLang: "extensions.fastread.remote.sourceLang",
   remoteTargetLang: "extensions.fastread.remote.targetLang",
   remoteModelConfig: "extensions.fastread.remote.modelConfig",
@@ -15,12 +18,148 @@ const PREF_DEFAULTS = Object.freeze({
   [PREF_KEYS.syncMode]: "ratio",
   [PREF_KEYS.remoteBaseURL]: "",
   [PREF_KEYS.remoteApiKey]: "",
+  [PREF_KEYS.remoteProvider]: "deepseek",
+  [PREF_KEYS.remoteModel]: "deepseek-chat",
+  [PREF_KEYS.remoteActiveModelId]: "",
   [PREF_KEYS.remoteSourceLang]: "en",
   [PREF_KEYS.remoteTargetLang]: "zh",
   [PREF_KEYS.remoteModelConfig]: "",
   [PREF_KEYS.remotePollIntervalMs]: "700",
   [PREF_KEYS.remotePollTimeoutSec]: "600"
 });
+
+const AI_PROVIDER_PRESETS = Object.freeze([
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    endpoint: "https://api.deepseek.com/v1",
+    defaultModel: "deepseek-chat",
+    models: ["deepseek-chat", "deepseek-reasoner"]
+  },
+  {
+    id: "openai",
+    label: "OpenAI",
+    endpoint: "https://api.openai.com/v1",
+    defaultModel: "gpt-4o-mini",
+    models: ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1", "o3-mini"]
+  },
+  {
+    id: "qwen",
+    label: "Qwen (DashScope)",
+    endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    defaultModel: "qwen-plus",
+    models: ["qwen-plus", "qwen-max", "qwen-turbo", "qwen2.5-72b-instruct"]
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    endpoint: "https://openrouter.ai/api/v1",
+    defaultModel: "openai/gpt-4o-mini",
+    models: ["openai/gpt-4o-mini", "deepseek/deepseek-chat", "anthropic/claude-3.5-sonnet", "google/gemini-2.0-flash"]
+  },
+  {
+    id: "siliconflow",
+    label: "SiliconFlow",
+    endpoint: "https://api.siliconflow.cn/v1",
+    defaultModel: "deepseek-ai/DeepSeek-V3",
+    models: ["deepseek-ai/DeepSeek-V3", "Qwen/Qwen2.5-72B-Instruct", "meta-llama/Meta-Llama-3.1-70B-Instruct"]
+  },
+  {
+    id: "moonshot",
+    label: "Moonshot",
+    endpoint: "https://api.moonshot.cn/v1",
+    defaultModel: "moonshot-v1-8k",
+    models: ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"]
+  },
+  {
+    id: "together",
+    label: "Together",
+    endpoint: "https://api.together.xyz/v1",
+    defaultModel: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+    models: ["meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo", "Qwen/Qwen2.5-72B-Instruct-Turbo", "deepseek-ai/DeepSeek-V3"]
+  },
+  {
+    id: "xai",
+    label: "xAI (Grok)",
+    endpoint: "https://api.x.ai/v1",
+    defaultModel: "grok-2-latest",
+    models: ["grok-2-latest", "grok-2-vision-latest"]
+  }
+]);
+
+const MAINSTREAM_MODEL_OPTIONS = Object.freeze(Array.from(new Set(
+  AI_PROVIDER_PRESETS.flatMap((preset) => preset.models || [])
+)));
+
+const PROVIDER_OPTIONS_HTML = AI_PROVIDER_PRESETS
+  .map((preset) => `<html:option value="${preset.id}">${preset.label}</html:option>`)
+  .join("\n");
+
+const MODEL_OPTIONS_HTML = MAINSTREAM_MODEL_OPTIONS
+  .map((model) => `<html:option value="${model}">${model}</html:option>`)
+  .join("\n");
+
+const MODEL_CONFIG_SAMPLE_JSON = `{
+  "endpoint": "https://api.deepseek.com/v1",
+  "model": "deepseek-chat",
+  "systemPrompt": "You are a professional academic translator. Translate accurately and naturally.",
+  "apiKey": "sk-optional-if-you-prefer-json-key"
+}`;
+
+const PROVIDER_TEST_TIMEOUT_MS = 60000;
+const PROVIDER_TEST_RETRY_TIMEOUT_MS = 120000;
+const LEGACY_FALLBACK_TASK_WAIT_MS = 45000;
+const TRANSLATED_PDF_FILE_NAME = "[fastRead 译文].pdf";
+const LEGACY_TRANSLATED_PDF_FILE_NAMES = Object.freeze([
+  "[fastRead 译文] PDF.pdf"
+]);
+
+const AI_TEST_MINIMAL_PDF_CONTENT = `%PDF-1.3
+%FASTREAD
+1 0 obj
+<<
+/Producer (pypdf)
+>>
+endobj
+2 0 obj
+<<
+/Type /Pages
+/Count 1
+/Kids [ 4 0 R ]
+>>
+endobj
+3 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+>>
+endobj
+4 0 obj
+<<
+/Type /Page
+/Resources <<
+>>
+/MediaBox [ 0.0 0.0 612 792 ]
+/Parent 2 0 R
+>>
+endobj
+xref
+0 5
+0000000000 65535 f 
+0000000015 00000 n 
+0000000054 00000 n 
+0000000113 00000 n 
+0000000162 00000 n 
+trailer
+<<
+/Size 5
+/Root 3 0 R
+/Info 1 0 R
+>>
+startxref
+256
+%%EOF
+`;
 
 const PREF_PANE_ID = "fastread-prefpane";
 const PREF_PANE_LABEL = "fastRead 设置";
@@ -174,12 +313,76 @@ const PREF_PANE_FRAGMENT = `
     #zdr-pref-root .zdr-status.is-error {
       color: var(--zdr-danger);
     }
+
+    #zdr-pref-root .zdr-json-example {
+      margin: 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--zdr-border);
+      background: color-mix(in srgb, var(--zdr-bg) 88%, #111827 12%);
+      color: var(--zdr-title);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    #zdr-pref-root .zdr-profile-list {
+      margin-top: 10px;
+      display: grid;
+      gap: 8px;
+    }
+
+    #zdr-pref-root .zdr-profile-row {
+      border: 1px solid var(--zdr-border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: color-mix(in srgb, var(--zdr-bg) 94%, #0f172a 6%);
+      display: grid;
+      gap: 8px;
+    }
+
+    #zdr-pref-root .zdr-profile-title {
+      margin: 0;
+      color: var(--zdr-title);
+      font-size: 13px;
+      font-weight: 600;
+      word-break: break-all;
+    }
+
+    #zdr-pref-root .zdr-profile-meta {
+      margin: 0;
+      color: var(--zdr-subtitle);
+      font-size: 12px;
+      line-height: 1.35;
+      word-break: break-all;
+    }
+
+    #zdr-pref-root .zdr-profile-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
   </html:style>
 
   <html:section class="zdr-pref-grid">
+    <html:article class="zdr-pref-card" id="zdr-active-model-card">
+      <html:h2 class="zdr-card-title">当前启用模型</html:h2>
+      <html:p class="zdr-card-subtitle">从已配置模型中选择本次翻译默认使用的模型配置。</html:p>
+      <html:div class="zdr-form-grid">
+        <html:label class="zdr-label" for="zdr-active-model-select">启用模型</html:label>
+        <html:select id="zdr-active-model-select" class="zdr-input" preference="${PREF_KEYS.remoteActiveModelId}">
+          <html:option value="">默认（当前提供商 / 模型）</html:option>
+        </html:select>
+      </html:div>
+      <html:p id="zdr-active-model-status" class="zdr-status" />
+    </html:article>
+
     <html:article class="zdr-pref-card" id="zdr-remote-api-card">
       <html:h2 class="zdr-card-title">AI 翻译配置</html:h2>
-      <html:p class="zdr-card-subtitle">填写 X-API-Key 与语言配置。插件会优先使用本地译文，缺失时自动提交任务。</html:p>
+      <html:p class="zdr-card-subtitle">选择 AI 提供商与模型。插件会优先使用本地译文，缺失时自动提交任务。</html:p>
       <html:div class="zdr-form-grid">
         <html:label class="zdr-label" for="zdr-remote-api-key">X-API-Key（必填）</html:label>
         <html:input
@@ -188,6 +391,23 @@ const PREF_PANE_FRAGMENT = `
           type="password"
           autocomplete="off"
           preference="${PREF_KEYS.remoteApiKey}" />
+
+        <html:label class="zdr-label" for="zdr-remote-provider">AI 提供商</html:label>
+        <html:select id="zdr-remote-provider" class="zdr-input" preference="${PREF_KEYS.remoteProvider}">
+          ${PROVIDER_OPTIONS_HTML}
+        </html:select>
+
+        <html:label class="zdr-label" for="zdr-remote-model">模型名称</html:label>
+        <html:input
+          id="zdr-remote-model"
+          class="zdr-input"
+          type="text"
+          list="zdr-remote-model-list"
+          placeholder="deepseek-chat"
+          preference="${PREF_KEYS.remoteModel}" />
+        <html:datalist id="zdr-remote-model-list">
+          ${MODEL_OPTIONS_HTML}
+        </html:datalist>
 
         <html:label class="zdr-label" for="zdr-remote-source-lang">源语言</html:label>
         <html:input
@@ -205,57 +425,34 @@ const PREF_PANE_FRAGMENT = `
           placeholder="zh"
           preference="${PREF_KEYS.remoteTargetLang}" />
 
-        <html:label class="zdr-label" for="zdr-remote-model-config">Model Config JSON（可选）</html:label>
-        <html:input
-          id="zdr-remote-model-config"
-          class="zdr-input"
-          type="text"
-          placeholder='{"model":"gpt-4o-mini"}'
-          preference="${PREF_KEYS.remoteModelConfig}" />
       </html:div>
 
       <html:div class="zdr-action-row">
-        <html:button id="zdr-remote-api-test-btn" class="zdr-btn" type="button">测试 API 连接</html:button>
-        <html:p id="zdr-remote-api-status" class="zdr-status" />
+        <html:button id="zdr-remote-api-test-btn-primary" class="zdr-btn" type="button">测试 AI 连接</html:button>
+        <html:p id="zdr-remote-api-status-primary" class="zdr-status" />
       </html:div>
+
     </html:article>
 
-    <html:article class="zdr-pref-card" id="zdr-advanced-card">
-      <html:h2 class="zdr-card-title">高级设置</html:h2>
-      <html:p class="zdr-card-subtitle">同步策略、任务 API 地址与轮询参数。</html:p>
+    <html:article class="zdr-pref-card" id="zdr-provider-json-card">
+      <html:h2 class="zdr-card-title">AI 源配置 JSON</html:h2>
+      <html:p class="zdr-card-subtitle">每次输入一个 JSON 配置并添加到列表；列表中的每项都可单独测试连接。</html:p>
+      <html:pre class="zdr-json-example">${MODEL_CONFIG_SAMPLE_JSON}</html:pre>
       <html:div class="zdr-form-grid">
-        <html:label class="zdr-label" for="zdr-sync-mode">同步策略</html:label>
-        <html:select id="zdr-sync-mode" class="zdr-input" preference="${PREF_KEYS.syncMode}">
-          <html:option value="ratio">滚动比例同步（推荐）</html:option>
-          <html:option value="page">页号同步（PDF.js 视图）</html:option>
-        </html:select>
-
-        <html:label class="zdr-label" for="zdr-remote-base-url">任务 API Base URL（可留空自动探测）</html:label>
-        <html:input
-          id="zdr-remote-base-url"
+        <html:label class="zdr-label" for="zdr-json-profile-input">新增 JSON 配置</html:label>
+        <html:textarea
+          id="zdr-json-profile-input"
           class="zdr-input"
-          type="url"
-          placeholder="留空自动探测本地服务"
-          preference="${PREF_KEYS.remoteBaseURL}" />
-
-        <html:label class="zdr-label" for="zdr-remote-poll-interval">轮询间隔 ms</html:label>
-        <html:input
-          id="zdr-remote-poll-interval"
-          class="zdr-input"
-          type="number"
-          min="500"
-          step="100"
-          preference="${PREF_KEYS.remotePollIntervalMs}" />
-
-        <html:label class="zdr-label" for="zdr-remote-poll-timeout">超时 s</html:label>
-        <html:input
-          id="zdr-remote-poll-timeout"
-          class="zdr-input"
-          type="number"
-          min="30"
-          step="10"
-          preference="${PREF_KEYS.remotePollTimeoutSec}" />
+          rows="6"
+          placeholder='${MODEL_CONFIG_SAMPLE_JSON}' />
       </html:div>
+
+      <html:div class="zdr-action-row">
+        <html:button id="zdr-json-profile-add-btn" class="zdr-btn" type="button">添加到列表</html:button>
+        <html:p id="zdr-json-profile-add-status" class="zdr-status" />
+      </html:div>
+
+      <html:div id="zdr-json-profile-list" class="zdr-profile-list" />
     </html:article>
   </html:section>
 </html:div>
@@ -423,6 +620,15 @@ async function resolveBackendExePath(rootURI) {
   return "";
 }
 
+async function resolveBackendScriptPath(rootURI) {
+  const fileURIPath = resolveBackendScriptPathFromFileURI(rootURI);
+  if (fileURIPath) {
+    return fileURIPath;
+  }
+
+  return materializeBackendScript(rootURI);
+}
+
 function resolveBundledBackendEntryPathForCurrentOS() {
   return BACKEND_BINARY_ZIP_ENTRY_BY_OS[String(Services.appinfo.OS || "")] || "";
 }
@@ -520,6 +726,27 @@ function resolveBackendExePathFromFileURI(rootURI) {
   }
 }
 
+function resolveBackendScriptPathFromFileURI(rootURI) {
+  try {
+    const uri = Services.io.newURI(String(rootURI || ""));
+    if (!uri || uri.scheme !== "file") {
+      return "";
+    }
+    const fileURL = uri.QueryInterface(Ci.nsIFileURL);
+    const addonRoot = fileURL.file;
+    const scriptFile = resolveAddonRelativeFile(addonRoot, BACKEND_SCRIPT_ZIP_ENTRY_PATH);
+    if (scriptFile?.exists()) {
+      return scriptFile.path;
+    }
+
+    return "";
+  }
+  catch (error) {
+    Zotero.logError(`fastRead: failed to resolve backend script path: ${error}`);
+    return "";
+  }
+}
+
 function materializeBackendExecutable(rootURI) {
   let zipReader = null;
   try {
@@ -572,6 +799,50 @@ function materializeBackendExecutable(rootURI) {
       }
       catch (error) {
         Zotero.logError(`fastRead: failed to close zip reader: ${error}`);
+      }
+    }
+  }
+}
+
+function materializeBackendScript(rootURI) {
+  let zipReader = null;
+  try {
+    const uri = Services.io.newURI(String(rootURI || ""));
+    if (!uri || uri.scheme !== "jar") {
+      return "";
+    }
+
+    const jarURI = uri.QueryInterface(Ci.nsIJARURI);
+    const jarFileURL = jarURI?.JARFile?.QueryInterface(Ci.nsIFileURL);
+    const jarFile = jarFileURL?.file || null;
+    if (!jarFile || !jarFile.exists()) {
+      return "";
+    }
+
+    zipReader = Cc["@mozilla.org/libjar/zip-reader;1"].createInstance(Ci.nsIZipReader);
+    zipReader.open(jarFile);
+    if (!zipReader.hasEntry(BACKEND_SCRIPT_ZIP_ENTRY_PATH)) {
+      return "";
+    }
+
+    const tempDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+    tempDir.append(BACKEND_TEMP_DIR_NAME);
+    if (!tempDir.exists()) {
+      tempDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+    }
+
+    return extractBackendEntry(zipReader, tempDir, BACKEND_SCRIPT_ZIP_ENTRY_PATH);
+  }
+  catch (error) {
+    Zotero.logError(`fastRead: failed to extract backend script from addon package: ${error}`);
+    return "";
+  }
+  finally {
+    if (zipReader) {
+      try {
+        zipReader.close();
+      }
+      catch (_error) {
       }
     }
   }
@@ -653,9 +924,10 @@ async function shutdownExistingLocalBackendServer() {
 
 async function startBackendServer(scriptPath, options = {}) {
   const allowReuseExisting = options.allowReuseExisting !== false;
+  const allowPythonFallbackOnBundledOS = options.allowPythonFallbackOnBundledOS === true;
 
   if (_backendProcess) {
-    return;
+    return true;
   }
 
   if (allowReuseExisting) {
@@ -665,18 +937,18 @@ async function startBackendServer(scriptPath, options = {}) {
       if (_lastBackendHealthyBaseURL) {
         Zotero.Prefs.set(PREF_KEYS.remoteBaseURL, _lastBackendHealthyBaseURL, true);
       }
-      return;
+      return true;
     }
   }
 
   if (!scriptPath) {
-    return;
+    return false;
   }
 
   const backendFile = toExistingLocalFile(scriptPath);
   if (!backendFile) {
     Zotero.debug(`fastRead: backend executable is missing at ${scriptPath}`);
-    return;
+    return false;
   }
   ensureBackendFileExecutable(backendFile);
 
@@ -686,15 +958,15 @@ async function startBackendServer(scriptPath, options = {}) {
   let processExecutable = null;
   let args = [];
   if (isPythonScript) {
-    if (shouldRequireBundledBackendForCurrentOS()) {
+    if (shouldRequireBundledBackendForCurrentOS() && !allowPythonFallbackOnBundledOS) {
       Zotero.logError("fastRead: Python fallback is disabled on Windows/macOS. Please package bundled backend binary in the XPI.");
-      return;
+      return false;
     }
 
     const pythonCommand = resolvePythonCommandForServer();
     if (!pythonCommand?.executable) {
       Zotero.logError("fastRead: Python runtime not found, cannot start server.py");
-      return;
+      return false;
     }
 
     processExecutable = pythonCommand.executable;
@@ -737,19 +1009,46 @@ async function startBackendServer(scriptPath, options = {}) {
     if (!healthy) {
       Zotero.logError("fastRead: backend process started but /health did not become ready.");
       await stopBackendServer();
-      return;
+      return false;
     }
 
     const resolvedBaseURL = _lastBackendHealthyBaseURL || LOCAL_REMOTE_BASE_URL_CANDIDATES[0];
     if (!readPref(PREF_KEYS.remoteBaseURL) || _backendManagedByAddon) {
       Zotero.Prefs.set(PREF_KEYS.remoteBaseURL, resolvedBaseURL, true);
     }
+    return true;
   }
   catch (error) {
     _backendProcess = null;
     _backendProcessObserver = null;
     _backendManagedByAddon = false;
     Zotero.logError(`fastRead: failed to start backend process: ${error}`);
+    return false;
+  }
+}
+
+async function tryUpgradeBackendToLatestServerScript() {
+  try {
+    const scriptPath = await resolveBackendScriptPath(_rootURI);
+    if (!scriptPath) {
+      return false;
+    }
+
+    await shutdownExistingLocalBackendServer();
+    const started = await startBackendServer(scriptPath, {
+      allowReuseExisting: false,
+      allowPythonFallbackOnBundledOS: true
+    });
+    if (!started) {
+      return false;
+    }
+
+    _backendExePath = scriptPath;
+    return true;
+  }
+  catch (error) {
+    Zotero.logError(`fastRead: failed to upgrade backend to latest server.py: ${error}`);
+    return false;
   }
 }
 
@@ -2258,11 +2557,512 @@ function cleanupPreferencesWindow(win) {
 }
 
 function attachPreferenceButtons(doc) {
+  bindProviderInputs(doc);
+  bindActiveModelInputs(doc);
+  bindJSONProfileManager(doc);
   attachButtonHandler(doc, {
-    buttonID: "zdr-remote-api-test-btn",
-    statusID: "zdr-remote-api-status",
+    buttonID: "zdr-remote-api-test-btn-primary",
+    statusID: "zdr-remote-api-status-primary",
     kind: "remoteApi"
   });
+}
+
+function bindProviderInputs(doc) {
+  const providerSelect = doc?.getElementById?.("zdr-remote-provider");
+  const modelInput = doc?.getElementById?.("zdr-remote-model");
+  if (!providerSelect || providerSelect.dataset.zdrBound === "1") {
+    return;
+  }
+
+  providerSelect.dataset.zdrBound = "1";
+  providerSelect.addEventListener("change", () => {
+    const providerID = String(providerSelect.value || "").trim();
+    const preset = getProviderPresetByID(providerID);
+    if (!preset) {
+      return;
+    }
+
+    if (modelInput) {
+      const currentModel = String(modelInput.value || "").trim();
+      if (!currentModel || currentModel === readPref(PREF_KEYS.remoteModel)) {
+        modelInput.value = preset.defaultModel;
+        Zotero.Prefs.set(PREF_KEYS.remoteModel, preset.defaultModel, true);
+      }
+    }
+
+    refreshActiveModelOptions(doc);
+    renderConfiguredProfileList(doc);
+  });
+
+  if (modelInput && modelInput.dataset.zdrBound !== "1") {
+    modelInput.dataset.zdrBound = "1";
+    modelInput.addEventListener("change", () => {
+      refreshActiveModelOptions(doc);
+      renderConfiguredProfileList(doc);
+    });
+  }
+}
+
+function bindActiveModelInputs(doc) {
+  const activeSelect = doc?.getElementById?.("zdr-active-model-select");
+  if (!activeSelect) {
+    return;
+  }
+
+  let newlyBound = false;
+  if (activeSelect.dataset.zdrBound !== "1") {
+    activeSelect.dataset.zdrBound = "1";
+    newlyBound = true;
+    activeSelect.addEventListener("change", () => {
+      const selected = String(activeSelect.value || "").trim();
+      const valueToSave = selected === "__default__" ? "" : selected;
+      Zotero.Prefs.set(PREF_KEYS.remoteActiveModelId, valueToSave, true);
+      refreshActiveModelOptions(doc);
+    });
+  }
+
+  if (newlyBound || activeSelect.dataset.zdrHydrated !== "1") {
+    refreshActiveModelOptions(doc);
+    activeSelect.dataset.zdrHydrated = "1";
+  }
+}
+
+function bindJSONProfileManager(doc) {
+  const addButton = doc?.getElementById?.("zdr-json-profile-add-btn");
+  const inputNode = doc?.getElementById?.("zdr-json-profile-input");
+  const statusNode = doc?.getElementById?.("zdr-json-profile-add-status");
+  const listNode = doc?.getElementById?.("zdr-json-profile-list");
+
+  if (addButton && addButton.dataset.zdrBound !== "1") {
+    addButton.dataset.zdrBound = "1";
+    addButton.addEventListener("click", () => {
+      void addJSONProfileFromInput(doc, inputNode, statusNode);
+    });
+  }
+
+  if (listNode && listNode.dataset.zdrHydrated !== "1") {
+    renderConfiguredProfileList(doc);
+  }
+}
+
+function readStoredModelConfigObject() {
+  return parseModelConfigJSON(readPref(PREF_KEYS.remoteModelConfig));
+}
+
+function writeStoredModelConfigObject(configObject) {
+  const payload = (configObject && typeof configObject === "object" && !Array.isArray(configObject))
+    ? configObject
+    : {};
+  Zotero.Prefs.set(PREF_KEYS.remoteModelConfig, safeJSONStringifyModelConfig(payload), true);
+}
+
+function detectProviderIDFromEndpoint(rawEndpoint) {
+  const endpoint = String(rawEndpoint || "").trim().toLowerCase();
+  if (!endpoint) {
+    return "";
+  }
+  if (endpoint.includes("deepseek")) {
+    return "deepseek";
+  }
+  if (endpoint.includes("openrouter")) {
+    return "openrouter";
+  }
+  if (endpoint.includes("siliconflow")) {
+    return "siliconflow";
+  }
+  if (endpoint.includes("dashscope") || endpoint.includes("aliyuncs")) {
+    return "qwen";
+  }
+  if (endpoint.includes("moonshot")) {
+    return "moonshot";
+  }
+  if (endpoint.includes("together")) {
+    return "together";
+  }
+  if (endpoint.includes("x.ai") || endpoint.includes("grok")) {
+    return "xai";
+  }
+  if (endpoint.includes("openai")) {
+    return "openai";
+  }
+  return "";
+}
+
+function buildStoredProfileFromInput(profileInput, fallbackID, fallbackProviderID, fallbackModelName, fallbackSourceLang, fallbackTargetLang) {
+  if (!profileInput || typeof profileInput !== "object" || Array.isArray(profileInput)) {
+    return null;
+  }
+
+  const endpointProvider = detectProviderIDFromEndpoint(profileInput.endpoint || profileInput.apiBase || profileInput.baseURL);
+  const providerID = String(
+    profileInput.providerConfigId
+    || profileInput.provider
+    || endpointProvider
+    || fallbackProviderID
+    || "deepseek"
+  ).trim().toLowerCase();
+  const modelName = String(profileInput.model || profileInput.modelName || fallbackModelName || "deepseek-chat").trim() || "deepseek-chat";
+  const sourceLang = String(profileInput.sourceLang || profileInput.source_lang || fallbackSourceLang || "en").trim() || "en";
+  const targetLang = String(profileInput.targetLang || profileInput.target_lang || fallbackTargetLang || "zh").trim() || "zh";
+  const profileID = toSafeProfileID(profileInput.id || profileInput.key, fallbackID);
+  const fallbackLabel = toCompactModelName(modelName) || modelName;
+  const label = String(profileInput.label || profileInput.name || fallbackLabel).trim() || fallbackLabel;
+
+  const stored = {
+    ...profileInput,
+    id: profileID,
+    label,
+    providerConfigId: providerID,
+    model: modelName,
+    sourceLang,
+    targetLang
+  };
+  delete stored.key;
+  delete stored.provider;
+  delete stored.modelName;
+  delete stored.source_lang;
+  delete stored.target_lang;
+  return stored;
+}
+
+function normalizeProfilesFromInputObject(parsedInput, fallbackProviderID, fallbackModelName, fallbackSourceLang, fallbackTargetLang) {
+  const profileCandidates = [];
+  if (Array.isArray(parsedInput)) {
+    profileCandidates.push(...parsedInput);
+  }
+  else if (parsedInput && typeof parsedInput === "object") {
+    if (Array.isArray(parsedInput.profiles)) {
+      profileCandidates.push(...parsedInput.profiles);
+    }
+    else if (Array.isArray(parsedInput.models)) {
+      profileCandidates.push(...parsedInput.models);
+    }
+    else {
+      profileCandidates.push(parsedInput);
+    }
+  }
+
+  const now = Date.now();
+  const normalized = [];
+  profileCandidates.forEach((item, index) => {
+    const profile = buildStoredProfileFromInput(
+      item,
+      `json-${now}-${index + 1}`,
+      fallbackProviderID,
+      fallbackModelName,
+      fallbackSourceLang,
+      fallbackTargetLang
+    );
+    if (profile) {
+      normalized.push(profile);
+    }
+  });
+  return normalized;
+}
+
+async function addJSONProfileFromInput(doc, inputNode, statusNode) {
+  const raw = String(inputNode?.value || "").trim();
+  if (!raw) {
+    setStatus(statusNode, "请先输入 JSON 配置。", "error");
+    return;
+  }
+
+  let parsedInput = null;
+  try {
+    parsedInput = JSON.parse(raw);
+  }
+  catch (error) {
+    setStatus(statusNode, `JSON 解析失败: ${error?.message || error}`, "error");
+    return;
+  }
+
+  const fallbackProviderID = readPref(PREF_KEYS.remoteProvider) || "deepseek";
+  const fallbackModelName = readPref(PREF_KEYS.remoteModel) || "deepseek-chat";
+  const fallbackSourceLang = readPref(PREF_KEYS.remoteSourceLang) || "en";
+  const fallbackTargetLang = readPref(PREF_KEYS.remoteTargetLang) || "zh";
+
+  const newProfiles = normalizeProfilesFromInputObject(
+    parsedInput,
+    fallbackProviderID,
+    fallbackModelName,
+    fallbackSourceLang,
+    fallbackTargetLang
+  );
+  if (!newProfiles.length) {
+    setStatus(statusNode, "未识别到有效模型配置，请检查 JSON 字段。", "error");
+    return;
+  }
+
+  const stored = readStoredModelConfigObject();
+  const existingProfiles = Array.isArray(stored.profiles)
+    ? stored.profiles.filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    : [];
+  const existingIDs = new Set(existingProfiles.map((item) => String(item.id || "").trim()).filter(Boolean));
+
+  for (const profile of newProfiles) {
+    let profileID = String(profile.id || "").trim();
+    if (!profileID) {
+      profileID = `json-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+    while (existingIDs.has(profileID)) {
+      profileID = `${profileID}-dup`;
+    }
+    profile.id = profileID;
+    existingIDs.add(profileID);
+    existingProfiles.push(profile);
+  }
+
+  const nextStored = {
+    ...stored,
+    profiles: existingProfiles
+  };
+  delete nextStored.models;
+  writeStoredModelConfigObject(nextStored);
+
+  if (inputNode) {
+    inputNode.value = "";
+  }
+  setStatus(statusNode, `已添加 ${newProfiles.length} 个配置。`, "success");
+  refreshActiveModelOptions(doc);
+  renderConfiguredProfileList(doc);
+}
+
+function resolveConnectionSelectionForProfile(profile, fallbackProviderID, fallbackModelName, fallbackSourceLang, fallbackTargetLang, rawJSON) {
+  const providerID = String(profile?.providerID || fallbackProviderID || "deepseek").trim().toLowerCase() || "deepseek";
+  const modelName = String(profile?.modelName || fallbackModelName || "deepseek-chat").trim() || "deepseek-chat";
+  const sourceLang = String(profile?.sourceLang || fallbackSourceLang || "en").trim() || "en";
+  const targetLang = String(profile?.targetLang || fallbackTargetLang || "zh").trim() || "zh";
+  const mergedBase = composeRemoteModelConfigObject(providerID, modelName, rawJSON);
+  const modelConfigObject = normalizeModelConfigPayload({
+    ...mergedBase,
+    ...(profile?.overrides || {})
+  });
+  if (!String(modelConfigObject.model || "").trim()) {
+    modelConfigObject.model = modelName;
+  }
+
+  return {
+    providerID,
+    modelName,
+    sourceLang,
+    targetLang,
+    modelConfigObject
+  };
+}
+
+function resolveTopLevelConnectionSelection(rawJSON, providerID, modelName, sourceLang, targetLang) {
+  const normalizedProviderID = String(providerID || "deepseek").trim().toLowerCase() || "deepseek";
+  const normalizedModelName = String(modelName || "deepseek-chat").trim() || "deepseek-chat";
+  const normalizedSourceLang = String(sourceLang || "en").trim() || "en";
+  const normalizedTargetLang = String(targetLang || "zh").trim() || "zh";
+
+  const preset = getProviderPresetByID(normalizedProviderID);
+  const parsedJSON = normalizeModelConfigPayload(parseModelConfigJSON(rawJSON));
+  const sanitizedJSON = {
+    ...parsedJSON
+  };
+  delete sanitizedJSON.model;
+  delete sanitizedJSON.modelName;
+  delete sanitizedJSON.provider;
+  delete sanitizedJSON.providerConfigId;
+  delete sanitizedJSON.sourceLang;
+  delete sanitizedJSON.source_lang;
+  delete sanitizedJSON.targetLang;
+  delete sanitizedJSON.target_lang;
+
+  const modelConfigObject = {
+    model: normalizedModelName,
+    ...(preset?.endpoint ? { endpoint: preset.endpoint } : {}),
+    ...sanitizedJSON
+  };
+  modelConfigObject.model = normalizedModelName;
+
+  return {
+    providerID: normalizedProviderID,
+    modelName: normalizedModelName,
+    sourceLang: normalizedSourceLang,
+    targetLang: normalizedTargetLang,
+    modelConfigObject
+  };
+}
+
+function renderConfiguredProfileList(doc) {
+  const listNode = doc?.getElementById?.("zdr-json-profile-list");
+  if (!listNode) {
+    return;
+  }
+
+  while (listNode.firstChild) {
+    listNode.removeChild(listNode.firstChild);
+  }
+
+  const fallbackProviderID = readPref(PREF_KEYS.remoteProvider) || "deepseek";
+  const fallbackModelName = readPref(PREF_KEYS.remoteModel) || "deepseek-chat";
+  const fallbackSourceLang = readPref(PREF_KEYS.remoteSourceLang) || "en";
+  const fallbackTargetLang = readPref(PREF_KEYS.remoteTargetLang) || "zh";
+  const rawJSON = readPref(PREF_KEYS.remoteModelConfig);
+  const profiles = extractConfiguredModelProfiles(rawJSON, fallbackProviderID, fallbackModelName);
+
+  if (!profiles.length) {
+    const emptyNode = listNode.ownerDocument.createElementNS("http://www.w3.org/1999/xhtml", "p");
+    emptyNode.className = "zdr-profile-meta";
+    emptyNode.textContent = "暂未添加自定义 JSON 配置。";
+    listNode.appendChild(emptyNode);
+    listNode.dataset.zdrHydrated = "1";
+    return;
+  }
+
+  for (const profile of profiles) {
+    const row = listNode.ownerDocument.createElementNS("http://www.w3.org/1999/xhtml", "div");
+    row.className = "zdr-profile-row";
+
+    const title = listNode.ownerDocument.createElementNS("http://www.w3.org/1999/xhtml", "p");
+    title.className = "zdr-profile-title";
+    title.textContent = String(profile.label || toCompactModelName(profile.modelName) || profile.modelName);
+    row.appendChild(title);
+
+    const endpoint = String(profile?.overrides?.endpoint || profile?.overrides?.apiBase || profile?.overrides?.baseURL || "").trim();
+    const meta = listNode.ownerDocument.createElementNS("http://www.w3.org/1999/xhtml", "p");
+    meta.className = "zdr-profile-meta";
+    meta.textContent = endpoint ? `endpoint: ${endpoint}` : "endpoint: 使用当前提供商默认地址";
+    row.appendChild(meta);
+
+    const actions = listNode.ownerDocument.createElementNS("http://www.w3.org/1999/xhtml", "div");
+    actions.className = "zdr-profile-actions";
+
+    const testButton = listNode.ownerDocument.createElementNS("http://www.w3.org/1999/xhtml", "button");
+    testButton.className = "zdr-btn";
+    testButton.setAttribute("type", "button");
+    testButton.textContent = "测试连接";
+    actions.appendChild(testButton);
+
+    const removeButton = listNode.ownerDocument.createElementNS("http://www.w3.org/1999/xhtml", "button");
+    removeButton.className = "zdr-btn";
+    removeButton.setAttribute("type", "button");
+    removeButton.textContent = "移除";
+    actions.appendChild(removeButton);
+
+    row.appendChild(actions);
+
+    const statusNode = listNode.ownerDocument.createElementNS("http://www.w3.org/1999/xhtml", "p");
+    statusNode.className = "zdr-status";
+    row.appendChild(statusNode);
+
+    testButton.addEventListener("click", () => {
+      const selectionOverride = resolveConnectionSelectionForProfile(
+        profile,
+        fallbackProviderID,
+        fallbackModelName,
+        fallbackSourceLang,
+        fallbackTargetLang,
+        rawJSON
+      );
+      void testRemoteAPIConnection(testButton, statusNode, selectionOverride);
+    });
+
+    removeButton.addEventListener("click", () => {
+      const stored = readStoredModelConfigObject();
+      const existingProfiles = Array.isArray(stored.profiles) ? stored.profiles : [];
+      const profileID = String(profile.id || "");
+      const nextProfiles = existingProfiles.filter((item) => String(item?.id || "") !== profileID);
+      const nextStored = {
+        ...stored
+      };
+
+      if (nextProfiles.length) {
+        nextStored.profiles = nextProfiles;
+      }
+      else {
+        delete nextStored.profiles;
+      }
+
+      if (Array.isArray(nextStored.models)) {
+        const remainingModels = nextStored.models.filter((item) => {
+          const id = String(item?.id || item?.key || "");
+          return id !== profileID;
+        });
+        if (remainingModels.length) {
+          nextStored.models = remainingModels;
+        }
+        else {
+          delete nextStored.models;
+        }
+      }
+
+      if (profileID === "json-inline") {
+        delete nextStored.endpoint;
+        delete nextStored.apiBase;
+        delete nextStored.api_base;
+        delete nextStored.baseURL;
+        delete nextStored.base_url;
+        delete nextStored.model;
+        delete nextStored.modelName;
+        delete nextStored.systemPrompt;
+        delete nextStored.apiKey;
+        delete nextStored.provider;
+        delete nextStored.providerConfigId;
+        delete nextStored.sourceLang;
+        delete nextStored.source_lang;
+        delete nextStored.targetLang;
+        delete nextStored.target_lang;
+      }
+
+      writeStoredModelConfigObject(nextStored);
+      if (String(readPref(PREF_KEYS.remoteActiveModelId) || "") === profileID) {
+        Zotero.Prefs.set(PREF_KEYS.remoteActiveModelId, "", true);
+      }
+      refreshActiveModelOptions(doc);
+      renderConfiguredProfileList(doc);
+      setStatus(statusNode, "已移除。", "success");
+    });
+
+    listNode.appendChild(row);
+  }
+
+  listNode.dataset.zdrHydrated = "1";
+}
+
+function refreshActiveModelOptions(doc) {
+  const activeSelect = doc?.getElementById?.("zdr-active-model-select");
+  const statusNode = doc?.getElementById?.("zdr-active-model-status");
+  if (!activeSelect) {
+    return;
+  }
+
+  const providerID = readPref(PREF_KEYS.remoteProvider) || "deepseek";
+  const modelName = readPref(PREF_KEYS.remoteModel) || "deepseek-chat";
+  const sourceLang = readPref(PREF_KEYS.remoteSourceLang) || "en";
+  const targetLang = readPref(PREF_KEYS.remoteTargetLang) || "zh";
+  const selection = resolveActiveModelSelection(
+    readPref(PREF_KEYS.remoteModelConfig),
+    readPref(PREF_KEYS.remoteActiveModelId),
+    providerID,
+    modelName,
+    sourceLang,
+    targetLang
+  );
+
+  while (activeSelect.firstChild) {
+    activeSelect.removeChild(activeSelect.firstChild);
+  }
+
+  for (const option of selection.options) {
+    const node = activeSelect.ownerDocument.createElementNS("http://www.w3.org/1999/xhtml", "option");
+    node.value = String(option.id || "");
+    node.textContent = String(option.label || node.value || "");
+    activeSelect.appendChild(node);
+  }
+
+  activeSelect.value = selection.activeModelID;
+  const prefValue = selection.activeModelID === "__default__" ? "" : selection.activeModelID;
+  if ((readPref(PREF_KEYS.remoteActiveModelId) || "") !== prefValue) {
+    Zotero.Prefs.set(PREF_KEYS.remoteActiveModelId, prefValue, true);
+  }
+
+  if (statusNode) {
+    const compactModelName = toCompactModelName(selection.modelName) || selection.modelName;
+    setStatus(statusNode, `当前生效：${compactModelName}（${selection.sourceLang} -> ${selection.targetLang}）`, "info");
+  }
 }
 
 function attachButtonHandler(doc, { buttonID, statusID, kind }) {
@@ -2331,6 +3131,378 @@ function buildRemoteTasksAPIURL(baseURL) {
   return `${base}/api/tasks`;
 }
 
+function buildRemoteProviderTestAPIURL(baseURL) {
+  const base = trimTrailingSlash(baseURL);
+  if (!base) {
+    return "";
+  }
+  if (/\/api\/tasks$/i.test(base)) {
+    return base.replace(/\/api\/tasks$/i, "/api/providers/test");
+  }
+  if (/\/api\/providers\/test$/i.test(base)) {
+    return base;
+  }
+  if (/\/api$/i.test(base)) {
+    return `${base}/providers/test`;
+  }
+  return `${base}/api/providers/test`;
+}
+
+function buildRemoteMetaAPIURL(baseURL) {
+  const base = trimTrailingSlash(baseURL);
+  if (!base) {
+    return "";
+  }
+  if (/\/api\/meta$/i.test(base)) {
+    return base;
+  }
+  if (/\/api\/tasks$/i.test(base)) {
+    return base.replace(/\/api\/tasks$/i, "/api/meta");
+  }
+  if (/\/api$/i.test(base)) {
+    return `${base}/meta`;
+  }
+  return `${base}/api/meta`;
+}
+
+async function probeRemoteBackendMeta(baseURL, headers) {
+  const metaURL = buildRemoteMetaAPIURL(baseURL);
+  if (!metaURL) {
+    return {
+      ok: false,
+      metaURL: "",
+      supportsProviderTest: false,
+      payload: {}
+    };
+  }
+
+  try {
+    const response = await fetchWithTimeout(metaURL, {
+      method: "GET",
+      headers: headers || {},
+      credentials: "include",
+      cache: "no-store"
+    }, 5000);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return {
+        ok: false,
+        metaURL,
+        supportsProviderTest: false,
+        payload
+      };
+    }
+
+    const capabilities = Array.isArray(payload?.capabilities) ? payload.capabilities : [];
+    const supportsProviderTest = capabilities.includes("provider_test") || capabilities.includes("providers_test") || payload?.supportsProviderTest === true;
+    return {
+      ok: true,
+      metaURL,
+      supportsProviderTest,
+      payload
+    };
+  }
+  catch (_error) {
+    return {
+      ok: false,
+      metaURL,
+      supportsProviderTest: false,
+      payload: {}
+    };
+  }
+}
+
+function getProviderPresetByID(providerID) {
+  const normalized = String(providerID || "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  return AI_PROVIDER_PRESETS.find((preset) => preset.id === normalized) || null;
+}
+
+function parseModelConfigJSON(rawJSON) {
+  const raw = String(rawJSON || "").trim();
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  }
+  catch (_error) {
+    return {};
+  }
+}
+
+function resolveEffectiveAPIKey(modelConfigObject, fallbackKey) {
+  const modelConfig = modelConfigObject && typeof modelConfigObject === "object" && !Array.isArray(modelConfigObject)
+    ? modelConfigObject
+    : {};
+  for (const keyName of ["apiKey", "api_key", "deepseekApiKey", "deepseek_api_key"]) {
+    const value = String(modelConfig[keyName] || "").trim();
+    if (value) {
+      return value;
+    }
+  }
+  return String(fallbackKey || "").trim();
+}
+
+function normalizeModelConfigPayload(rawConfig) {
+  if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
+    return {};
+  }
+
+  const cleaned = {
+    ...rawConfig
+  };
+  delete cleaned.models;
+  delete cleaned.profiles;
+  delete cleaned.activeModelId;
+  delete cleaned.activeModelID;
+  delete cleaned.selectedModelId;
+  delete cleaned.selectedProfileId;
+  return cleaned;
+}
+
+function toSafeProfileID(raw, fallback) {
+  const value = String(raw || "").trim();
+  if (value) {
+    return value;
+  }
+  return String(fallback || "").trim() || "profile-1";
+}
+
+function toCompactModelName(rawModel) {
+  const normalized = String(rawModel || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  const parts = normalized.split("/").map((part) => String(part || "").trim()).filter(Boolean);
+  if (!parts.length) {
+    return normalized;
+  }
+  return parts[parts.length - 1];
+}
+
+function extractConfiguredModelProfiles(rawJSON, fallbackProviderID, fallbackModelName) {
+  const parsed = parseModelConfigJSON(rawJSON);
+  const list = [];
+  const pushProfile = (profileInput, fallbackID) => {
+    if (!profileInput || typeof profileInput !== "object" || Array.isArray(profileInput)) {
+      return;
+    }
+    const providerID = String(profileInput.providerConfigId || profileInput.provider || fallbackProviderID || "").trim().toLowerCase() || String(fallbackProviderID || "deepseek").trim().toLowerCase();
+    const modelName = String(profileInput.model || profileInput.modelName || fallbackModelName || "").trim() || String(fallbackModelName || "deepseek-chat").trim();
+    const profileID = toSafeProfileID(profileInput.id || profileInput.key, fallbackID);
+    const compactModelName = toCompactModelName(modelName) || modelName;
+    const profileLabel = compactModelName;
+    const sourceLang = String(profileInput.sourceLang || profileInput.source_lang || "").trim();
+    const targetLang = String(profileInput.targetLang || profileInput.target_lang || "").trim();
+
+    const overrides = {
+      ...profileInput
+    };
+    delete overrides.id;
+    delete overrides.key;
+    delete overrides.label;
+    delete overrides.name;
+    delete overrides.provider;
+    delete overrides.providerConfigId;
+    delete overrides.model;
+    delete overrides.modelName;
+    delete overrides.sourceLang;
+    delete overrides.source_lang;
+    delete overrides.targetLang;
+    delete overrides.target_lang;
+
+    list.push({
+      id: profileID,
+      label: profileLabel,
+      providerID,
+      modelName,
+      sourceLang,
+      targetLang,
+      overrides: normalizeModelConfigPayload(overrides)
+    });
+  };
+
+  const profileArray = Array.isArray(parsed.profiles) ? parsed.profiles : Array.isArray(parsed.models) ? parsed.models : [];
+  profileArray.forEach((item, index) => {
+    pushProfile(item, `profile-${index + 1}`);
+  });
+
+  if (list.length === 0) {
+    const normalizedRoot = normalizeModelConfigPayload(parsed);
+    const hasRootModel = String(parsed.model || parsed.modelName || "").trim();
+    const hasRootProvider = String(parsed.providerConfigId || parsed.provider || "").trim();
+    const hasRootEndpoint = String(parsed.endpoint || parsed.apiBase || parsed.baseURL || "").trim();
+    if (hasRootModel || hasRootProvider || hasRootEndpoint) {
+      pushProfile(parsed, "json-inline");
+      if (list.length && Object.keys(normalizedRoot).length) {
+        list[list.length - 1].overrides = normalizedRoot;
+      }
+    }
+  }
+
+  return list;
+}
+
+function resolveActiveModelSelection(rawJSON, preferredActiveID, fallbackProviderID, fallbackModelName, fallbackSourceLang, fallbackTargetLang) {
+  const profiles = extractConfiguredModelProfiles(rawJSON, fallbackProviderID, fallbackModelName);
+  const defaultID = "__default__";
+  const selectedByPref = String(preferredActiveID || "").trim();
+  const parsed = parseModelConfigJSON(rawJSON);
+  const selectedByJSON = String(parsed.activeModelId || parsed.activeModelID || parsed.selectedModelId || parsed.selectedProfileId || "").trim();
+  const candidateID = selectedByPref || selectedByJSON;
+  const selectedProfile = profiles.find((item) => item.id === candidateID) || null;
+
+  const providerID = selectedProfile?.providerID || String(fallbackProviderID || "deepseek").trim().toLowerCase();
+  const modelName = selectedProfile?.modelName || String(fallbackModelName || "deepseek-chat").trim();
+  const sourceLang = selectedProfile?.sourceLang || String(fallbackSourceLang || "en").trim() || "en";
+  const targetLang = selectedProfile?.targetLang || String(fallbackTargetLang || "zh").trim() || "zh";
+  const mergedBase = composeRemoteModelConfigObject(providerID, modelName, rawJSON);
+  const modelConfigObject = {
+    ...mergedBase,
+    ...(selectedProfile?.overrides || {})
+  };
+  if (!String(modelConfigObject.model || "").trim()) {
+    modelConfigObject.model = modelName;
+  }
+
+  return {
+    activeModelID: selectedProfile?.id || defaultID,
+    providerID,
+    modelName,
+    sourceLang,
+    targetLang,
+    modelConfigObject: normalizeModelConfigPayload(modelConfigObject),
+    options: [
+      {
+        id: defaultID,
+        label: `默认：${toCompactModelName(fallbackModelName || "deepseek-chat") || String(fallbackModelName || "deepseek-chat").trim()}`
+      },
+      ...profiles.map((item) => ({ id: item.id, label: item.label }))
+    ]
+  };
+}
+
+function safeJSONStringifyModelConfig(configObject) {
+  try {
+    return JSON.stringify(configObject || {});
+  }
+  catch (_error) {
+    return "{}";
+  }
+}
+
+function composeRemoteModelConfigObject(providerID, modelName, rawJSON) {
+  const preset = getProviderPresetByID(providerID);
+  const selectedModel = String(modelName || "").trim() || String(preset?.defaultModel || "").trim() || "deepseek-chat";
+  const baseConfig = {
+    model: selectedModel
+  };
+
+  if (preset?.endpoint) {
+    baseConfig.endpoint = preset.endpoint;
+  }
+
+  const userConfig = normalizeModelConfigPayload(parseModelConfigJSON(rawJSON));
+  const merged = {
+    ...baseConfig,
+    ...userConfig
+  };
+
+  if (!String(merged.model || "").trim()) {
+    merged.model = selectedModel;
+  }
+  return merged;
+}
+
+function buildAITestPdfBytes() {
+  const encoder = getTextEncoder();
+  return encoder.encode(AI_TEST_MINIMAL_PDF_CONTENT);
+}
+
+async function runLegacyProviderTestViaTasksAPI(serviceBaseURL, headers, providerID, modelConfigObject, sourceLang, targetLang) {
+  const createURL = buildBatchCreateTaskURL(serviceBaseURL) || buildRemoteTasksAPIURL(serviceBaseURL);
+  if (!createURL) {
+    throw new Error("任务接口地址无效。请检查 Base URL 配置。");
+  }
+
+  const modelConfigJSON = safeJSONStringifyModelConfig(modelConfigObject);
+  const fields = {
+    documentName: "fastread-ai-test.pdf",
+    taskType: "translation",
+    sourceLang,
+    targetLang,
+    engine: "openai",
+    priority: "normal",
+    providerConfigId: providerID,
+    modelConfig: modelConfigJSON
+  };
+
+  const multipart = buildMultipartPayload("fastread-ai-test.pdf", buildAITestPdfBytes(), fields);
+  const requestHeaders = {
+    ...(headers || {})
+  };
+  if (multipart.contentType) {
+    requestHeaders["Content-Type"] = multipart.contentType;
+  }
+
+  const createResponse = await fetchWithTimeout(createURL, {
+    method: "POST",
+    headers: requestHeaders,
+    credentials: "include",
+    body: multipart.body
+  }, 45000);
+  const createPayload = await createResponse.json().catch(() => ({}));
+  if (!createResponse.ok) {
+    const message = extractTaskError(createPayload) || `${createResponse.status} ${createResponse.statusText}`;
+    throw new Error(`创建测试任务失败: ${message}`);
+  }
+
+  const taskID = extractTaskID(createPayload);
+  if (!taskID) {
+    throw new Error("创建测试任务成功，但未返回任务 ID。请稍后重试。");
+  }
+
+  const detailURL = buildBatchDetailTaskURL(serviceBaseURL, taskID);
+  if (!detailURL) {
+    throw new Error("测试任务详情地址无效。请检查 Base URL。");
+  }
+
+  const startedAt = Date.now();
+  const timeoutMs = LEGACY_FALLBACK_TASK_WAIT_MS;
+  while (Date.now() - startedAt < timeoutMs) {
+    const detailResponse = await fetchWithTimeout(`${detailURL}?_ts=${Date.now()}`, {
+      method: "GET",
+      headers: headers || {},
+      credentials: "include"
+    }, 20000);
+    const detailPayload = await detailResponse.json().catch(() => ({}));
+    if (!detailResponse.ok) {
+      const message = extractTaskError(detailPayload) || `${detailResponse.status} ${detailResponse.statusText}`;
+      throw new Error(`查询测试任务状态失败: ${message}`);
+    }
+
+    const status = extractTaskStatus(detailPayload);
+    if (status === "completed") {
+      return {
+        taskID,
+        outputURL: String(extractMonoOutputUrl(detailPayload) || "").trim()
+      };
+    }
+    if (["failed", "error", "cancelled", "canceled"].includes(status)) {
+      const message = extractTaskError(detailPayload) || status;
+      throw new Error(`测试翻译任务失败: ${message}`);
+    }
+
+    await delay(1200);
+  }
+
+  throw new Error("测试任务等待超时（旧版服务）。请先尝试翻译 1-2 页 PDF 验证连通性。\n如果可行，请升级到新版本后再使用 AI 测试接口。");
+}
+
 function isReachableRemoteAPIResponse(response) {
   if (!response) {
     return false;
@@ -2338,7 +3510,32 @@ function isReachableRemoteAPIResponse(response) {
   return response.ok || response.status === 401 || response.status === 403;
 }
 
-async function probeRemoteTasksAPI(baseURL, headers) {
+async function probeFastReadHealth(baseURL) {
+  const normalizedBase = trimTrailingSlash(baseURL);
+  if (!normalizedBase) {
+    return false;
+  }
+
+  try {
+    const response = await fetchWithTimeout(`${normalizedBase}/health?_ts=${Date.now()}`, {
+      method: "GET",
+      cache: "no-store"
+    }, 2500);
+    if (!response.ok) {
+      return false;
+    }
+
+    const payload = await response.json().catch(() => ({}));
+    const service = String(payload?.service || "").toLowerCase();
+    const status = String(payload?.status || "").toLowerCase();
+    return service === "fastread-server" && status === "ok";
+  }
+  catch (_error) {
+    return false;
+  }
+}
+
+async function probeRemoteTasksAPI(baseURL, headers, options = {}) {
   const normalizedBase = trimTrailingSlash(baseURL);
   const endpoint = buildRemoteTasksAPIURL(normalizedBase);
   if (!endpoint) {
@@ -2352,12 +3549,20 @@ async function probeRemoteTasksAPI(baseURL, headers) {
       credentials: "include"
     }, 4000);
     const payload = await response.json().catch(() => ({}));
+    let reachable = isReachableRemoteAPIResponse(response);
+    if (reachable && options.requireFastReadHealth) {
+      const healthy = await probeFastReadHealth(normalizedBase);
+      if (!healthy) {
+        reachable = false;
+      }
+    }
+
     return {
       baseURL: normalizedBase,
       endpoint,
       response,
       payload,
-      reachable: isReachableRemoteAPIResponse(response)
+      reachable
     };
   }
   catch (error) {
@@ -2372,22 +3577,69 @@ async function probeRemoteTasksAPI(baseURL, headers) {
   }
 }
 
-function buildRemoteAPIHeaders() {
+function buildRemoteAPIHeaders(apiKeyOverride = null) {
   const headers = {};
-  const apiKey = readPref(PREF_KEYS.remoteApiKey);
+  const candidate = apiKeyOverride === null || apiKeyOverride === undefined
+    ? readPref(PREF_KEYS.remoteApiKey)
+    : apiKeyOverride;
+  const apiKey = String(candidate || "").trim();
   if (apiKey) {
     headers["X-API-Key"] = apiKey;
   }
   return headers;
 }
 
-async function testRemoteAPIConnection(button, statusNode) {
+function isRequestTimeoutError(error) {
+  const message = String(error?.message || error || "");
+  return /timed out/i.test(message);
+}
+
+async function postProviderTestRequest(testURL, headers, requestPayload, timeoutMs) {
+  const response = await fetchWithTimeout(testURL, {
+    method: "POST",
+    headers: {
+      ...(headers || {}),
+      "Content-Type": "application/json"
+    },
+    credentials: "include",
+    body: JSON.stringify(requestPayload || {})
+  }, timeoutMs);
+  const payload = await response.json().catch(() => ({}));
+  return { response, payload };
+}
+
+async function testRemoteAPIConnection(button, statusNode, selectionOverride = null) {
   const configuredBaseURL = trimTrailingSlash(readPref(PREF_KEYS.remoteBaseURL));
-  const headers = buildRemoteAPIHeaders();
+  const topLevelProviderID = readPref(PREF_KEYS.remoteProvider) || "deepseek";
+  const topLevelModelName = readPref(PREF_KEYS.remoteModel) || "deepseek-chat";
+  const topLevelSourceLang = readPref(PREF_KEYS.remoteSourceLang) || "en";
+  const topLevelTargetLang = readPref(PREF_KEYS.remoteTargetLang) || "zh";
+  const topLevelSelection = resolveTopLevelConnectionSelection(
+    readPref(PREF_KEYS.remoteModelConfig),
+    topLevelProviderID,
+    topLevelModelName,
+    topLevelSourceLang,
+    topLevelTargetLang
+  );
+  const activeSelection = selectionOverride && typeof selectionOverride === "object"
+    ? selectionOverride
+    : topLevelSelection;
+  const providerID = activeSelection.providerID;
+  const modelName = activeSelection.modelName;
+  const sourceLang = activeSelection.sourceLang;
+  const targetLang = activeSelection.targetLang;
+  const modelConfigObject = activeSelection.modelConfigObject;
+  const apiKey = resolveEffectiveAPIKey(modelConfigObject, readPref(PREF_KEYS.remoteApiKey));
+  const headers = buildRemoteAPIHeaders(apiKey);
   const autoDetect = !configuredBaseURL;
+  if (!apiKey) {
+    setStatus(statusNode, "请先填写 X-API-Key，或在 JSON 配置中提供 apiKey。", "error");
+    return;
+  }
+
   setStatus(statusNode, autoDetect
-    ? "未填写 URL，正在自动探测本地任务服务..."
-    : "正在测试任务 API 连接...", "info");
+    ? "未填写 URL，正在自动探测本地服务并测试 AI 连接..."
+    : "正在测试 AI 连接...", "info");
   button.disabled = true;
 
   try {
@@ -2396,14 +3648,24 @@ async function testRemoteAPIConnection(button, statusNode) {
     }
 
     let probe = null;
+    let serviceBaseURL = "";
 
     if (configuredBaseURL) {
-      probe = await probeRemoteTasksAPI(configuredBaseURL, headers);
+      const strictLocalProbe = isLocalFastReadBaseURL(configuredBaseURL);
+      probe = await probeRemoteTasksAPI(configuredBaseURL, headers, {
+        requireFastReadHealth: strictLocalProbe
+      });
+      if (probe?.reachable) {
+        serviceBaseURL = trimTrailingSlash(probe.baseURL || configuredBaseURL);
+      }
     }
     else {
       for (const candidate of LOCAL_REMOTE_BASE_URL_CANDIDATES) {
-        probe = await probeRemoteTasksAPI(candidate, headers);
+        probe = await probeRemoteTasksAPI(candidate, headers, {
+          requireFastReadHealth: true
+        });
         if (probe?.reachable) {
+          serviceBaseURL = trimTrailingSlash(probe.baseURL || candidate);
           break;
         }
       }
@@ -2412,37 +3674,130 @@ async function testRemoteAPIConnection(button, statusNode) {
       }
     }
 
-    if (!probe) {
-      setStatus(statusNode, "连接失败: 任务 API URL 无效。", "error");
-      return;
+    if (!serviceBaseURL && isLocalFastReadBaseURL(configuredBaseURL)) {
+      serviceBaseURL = configuredBaseURL;
     }
 
-    if (!probe.response) {
+    if (!serviceBaseURL && _lastBackendHealthyBaseURL) {
+      serviceBaseURL = trimTrailingSlash(_lastBackendHealthyBaseURL);
+    }
+
+    if (!serviceBaseURL) {
       if (!configuredBaseURL) {
-        setStatus(statusNode, "未探测到本地任务服务。请确认 fastRead 插件服务已随 Zotero 启动，或重启 Zotero 后重试。", "error");
+        setStatus(statusNode, "未探测到本地服务。请确认 Zotero 已重启并加载 fastRead。", "error");
       }
       else {
-        setStatus(statusNode, `连接失败: 无法访问 ${probe.endpoint}`, "error");
+        setStatus(statusNode, `连接失败: 无法访问 ${configuredBaseURL}`, "error");
       }
       return;
     }
 
-    if (probe.response.ok) {
-      const suffix = configuredBaseURL ? "" : `（自动探测: ${probe.baseURL}）`;
-      setStatus(statusNode, `任务 API 连接成功${suffix}。`, "success");
+    let testURL = buildRemoteProviderTestAPIURL(serviceBaseURL);
+    if (!testURL) {
+      setStatus(statusNode, "连接失败: 测试接口地址无效。", "error");
       return;
     }
 
-    if (probe.response.status === 401 || probe.response.status === 403) {
-      const suffix = configuredBaseURL ? "" : `（自动探测: ${probe.baseURL}）`;
-      setStatus(statusNode, `服务可达${suffix}，但鉴权失败。请检查 Token / API Key。`, "error");
+    let metaProbe = await probeRemoteBackendMeta(serviceBaseURL, headers);
+    if (!metaProbe.supportsProviderTest && isLocalFastReadBaseURL(serviceBaseURL)) {
+      const upgraded = await tryUpgradeBackendToLatestServerScript();
+      if (upgraded) {
+        if (_lastBackendHealthyBaseURL) {
+          serviceBaseURL = trimTrailingSlash(_lastBackendHealthyBaseURL);
+        }
+        testURL = buildRemoteProviderTestAPIURL(serviceBaseURL);
+        metaProbe = await probeRemoteBackendMeta(serviceBaseURL, headers);
+      }
+    }
+
+    const providerTestPayload = {
+      engine: "openai",
+      providerConfigId: providerID,
+      modelConfig: modelConfigObject,
+      sourceLang,
+      targetLang
+    };
+
+    let providerTestResponse = null;
+    let providerPayload = {};
+    try {
+      const firstAttempt = await postProviderTestRequest(testURL, headers, providerTestPayload, PROVIDER_TEST_TIMEOUT_MS);
+      providerTestResponse = firstAttempt.response;
+      providerPayload = firstAttempt.payload;
+    }
+    catch (firstError) {
+      if (!isRequestTimeoutError(firstError)) {
+        throw firstError;
+      }
+
+      setStatus(statusNode, "AI 测试响应较慢，正在重试（最长 120s）...", "info");
+      const secondAttempt = await postProviderTestRequest(testURL, headers, providerTestPayload, PROVIDER_TEST_RETRY_TIMEOUT_MS);
+      providerTestResponse = secondAttempt.response;
+      providerPayload = secondAttempt.payload;
+    }
+
+    if (!providerTestResponse.ok || !providerPayload?.ok) {
+      const reason = providerPayload?.detail || providerPayload?.message || providerPayload?.error || `${providerTestResponse.status} ${providerTestResponse.statusText}`;
+      if (providerTestResponse.status === 404) {
+        if (isLocalFastReadBaseURL(serviceBaseURL) && metaProbe.supportsProviderTest) {
+          const upgraded = await tryUpgradeBackendToLatestServerScript();
+          if (upgraded) {
+            if (_lastBackendHealthyBaseURL) {
+              serviceBaseURL = trimTrailingSlash(_lastBackendHealthyBaseURL);
+            }
+            testURL = buildRemoteProviderTestAPIURL(serviceBaseURL);
+            const retriedAttempt = await postProviderTestRequest(testURL, headers, providerTestPayload, PROVIDER_TEST_TIMEOUT_MS);
+            const retriedResponse = retriedAttempt.response;
+            const retriedPayload = retriedAttempt.payload;
+            if (retriedResponse.ok && retriedPayload?.ok) {
+              const suffix = autoDetect ? `（自动探测: ${serviceBaseURL}）` : "";
+              setStatus(statusNode, `连接成功${suffix}：服务已升级到最新接口（${providerID} / ${retriedPayload?.model || modelName}）。`, "success");
+              return;
+            }
+          }
+        }
+
+        const legacyProbe = await probeRemoteTasksAPI(serviceBaseURL, headers, {
+          requireFastReadHealth: false
+        });
+        if (!legacyProbe?.response) {
+          setStatus(statusNode, "连接失败: 旧版服务不可达，请确认本地服务已启动。", "error");
+          return;
+        }
+
+        if (legacyProbe.response.status === 401 || legacyProbe.response.status === 403) {
+          setStatus(statusNode, "连接失败: 旧版服务鉴权失败，请检查 API Key。", "error");
+          return;
+        }
+
+        if (!legacyProbe.response.ok) {
+          const message = legacyProbe.payload?.detail || legacyProbe.payload?.message || legacyProbe.payload?.error || `${legacyProbe.response.status} ${legacyProbe.response.statusText}`;
+          setStatus(statusNode, `连接失败: 旧版服务任务接口异常 (${message})`, "error");
+          return;
+        }
+
+        const suffix = autoDetect ? `（自动探测: ${serviceBaseURL}）` : "";
+        setStatus(statusNode, `连接成功${suffix}：旧版服务（兼容模式）任务接口可用。若需完整 AI 连通性校验，请直接翻译 1-2 页 PDF。`, "success");
+        return;
+      }
+
+      if (providerTestResponse.status === 401 || /invalid_api_key|token\s+expired/i.test(String(reason))) {
+        setStatus(statusNode, "AI 测试失败: API Key 无效或已过期，请在 AI 源配置中更换可用密钥后重试。", "error");
+        return;
+      }
+
+      setStatus(statusNode, `AI 测试失败: ${reason}`, "error");
       return;
     }
 
-    const message = probe.payload?.message || probe.payload?.error || probe.response.statusText || "Request failed";
-    setStatus(statusNode, `连接失败: HTTP ${probe.response.status} ${message} (${probe.endpoint})`, "error");
+    const suffix = autoDetect ? `（自动探测: ${serviceBaseURL}）` : "";
+    setStatus(statusNode, `连接成功${suffix}：${providerID} / ${providerPayload?.model || modelName}`, "success");
   }
   catch (error) {
+    if (isRequestTimeoutError(error)) {
+      setStatus(statusNode, "连接失败: AI 测试超时。请检查 endpoint 可达性、网络代理，或稍后重试。", "error");
+      return;
+    }
     setStatus(statusNode, `连接失败: ${error.message}`, "error");
   }
   finally {
@@ -2868,11 +4223,17 @@ async function hasBatchTranslatedOutput(filePath, fileName) {
 
   const parts = splitFileNameAndExt(fileName);
   const translatedCandidates = [
+    joinPath(sourceDir, TRANSLATED_PDF_FILE_NAME),
     joinPath(sourceDir, `[fastRead 译文] ${parts.baseName}.${parts.ext || "pdf"}`),
-    joinPath(sourceDir, "[fastRead 译文] PDF.pdf")
+    ...LEGACY_TRANSLATED_PDF_FILE_NAMES.map((name) => joinPath(sourceDir, name))
   ];
 
+  const seen = new Set();
   for (const candidate of translatedCandidates) {
+    if (seen.has(candidate)) {
+      continue;
+    }
+    seen.add(candidate);
     if (!candidate || candidate === filePath) {
       continue;
     }
@@ -3014,12 +4375,21 @@ async function listBatchPdfFilesBySource(source) {
 function getBatchTranslateConfig() {
   const intervalMs = Math.max(500, Number(readPref(PREF_KEYS.remotePollIntervalMs)) || 1500);
   const timeoutSec = Math.max(30, Number(readPref(PREF_KEYS.remotePollTimeoutSec)) || 600);
+  const activeSelection = resolveActiveModelSelection(
+    readPref(PREF_KEYS.remoteModelConfig),
+    readPref(PREF_KEYS.remoteActiveModelId),
+    readPref(PREF_KEYS.remoteProvider) || "deepseek",
+    readPref(PREF_KEYS.remoteModel) || "deepseek-chat",
+    readPref(PREF_KEYS.remoteSourceLang) || "en",
+    readPref(PREF_KEYS.remoteTargetLang) || "zh"
+  );
   return {
     baseURL: trimTrailingSlash(readPref(PREF_KEYS.remoteBaseURL)),
-    apiKey: readPref(PREF_KEYS.remoteApiKey),
-    sourceLang: readPref(PREF_KEYS.remoteSourceLang) || "en",
-    targetLang: readPref(PREF_KEYS.remoteTargetLang) || "zh",
-    modelConfig: readPref(PREF_KEYS.remoteModelConfig),
+    apiKey: resolveEffectiveAPIKey(activeSelection.modelConfigObject, readPref(PREF_KEYS.remoteApiKey)),
+    providerConfigId: activeSelection.providerID,
+    sourceLang: activeSelection.sourceLang,
+    targetLang: activeSelection.targetLang,
+    modelConfig: safeJSONStringifyModelConfig(activeSelection.modelConfigObject),
     engine: "openai",
     priority: "normal",
     pollIntervalMs: intervalMs,
@@ -3048,7 +4418,9 @@ async function resolveBatchRemoteBaseURL(config) {
     if (isLocalFastReadBaseURL(explicit)) {
       await ensureBackendServerStarted();
     }
-    const explicitProbe = await probeRemoteTasksAPI(explicit, headers);
+    const explicitProbe = await probeRemoteTasksAPI(explicit, headers, {
+      requireFastReadHealth: isLocalFastReadBaseURL(explicit)
+    });
     if (explicitProbe?.reachable) {
       return explicit;
     }
@@ -3056,7 +4428,9 @@ async function resolveBatchRemoteBaseURL(config) {
 
   await ensureBackendServerStarted();
   for (const candidate of LOCAL_REMOTE_BASE_URL_CANDIDATES) {
-    const probe = await probeRemoteTasksAPI(candidate, headers);
+    const probe = await probeRemoteTasksAPI(candidate, headers, {
+      requireFastReadHealth: true
+    });
     if (!probe?.reachable || !probe.baseURL) {
       continue;
     }
@@ -3232,6 +4606,7 @@ async function submitBatchTranslationTask(config, fileInfo) {
     targetLang: config.targetLang,
     engine: config.engine,
     priority: config.priority,
+    providerConfigId: config.providerConfigId,
     modelConfig: config.modelConfig
   };
   const multipart = buildMultipartPayload(fileInfo.fileName, fileBytes, fields);
@@ -3447,8 +4822,7 @@ async function downloadBatchTaskOutput(config, fileInfo, payload) {
     throw new Error("下载译文失败：返回文件为空。");
   }
 
-  const parts = splitFileNameAndExt(fileInfo.fileName);
-  const outputName = `[fastRead 译文] ${parts.baseName}.${parts.ext || "pdf"}`;
+  const outputName = TRANSLATED_PDF_FILE_NAME;
   const outputPath = joinPath(sourceDir, outputName);
   await writeBinaryFile(outputPath, bytes);
 }

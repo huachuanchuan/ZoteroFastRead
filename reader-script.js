@@ -46,6 +46,10 @@
     "http://127.0.0.1:38000",
     "http://localhost:38000"
   ]);
+  const TRANSLATED_PDF_FILE_NAME = "[fastRead 译文].pdf";
+  const LEGACY_TRANSLATED_PDF_FILE_NAMES = Object.freeze([
+    "[fastRead 译文] PDF.pdf"
+  ]);
 
   const _sessionsByReader = new WeakMap();
   const _sessions = new Set();
@@ -2099,6 +2103,32 @@
     return false;
   }
 
+  function getTranslatedPdfPathCandidates(sourceDir) {
+    const base = String(sourceDir || "").trim();
+    if (!base) {
+      return [];
+    }
+
+    const candidates = [
+      TRANSLATED_PDF_FILE_NAME,
+      ...LEGACY_TRANSLATED_PDF_FILE_NAMES
+    ]
+      .map((fileName) => joinFilePath(base, fileName))
+      .filter(Boolean);
+
+    return Array.from(new Set(candidates));
+  }
+
+  async function findExistingTranslatedPdfPath(sourceDir) {
+    const candidates = getTranslatedPdfPathCandidates(sourceDir);
+    for (const candidate of candidates) {
+      if (await fileExists(candidate)) {
+        return candidate;
+      }
+    }
+    return "";
+  }
+
   async function getAttachmentFilePath(attachment) {
     if (!attachment) {
       return "";
@@ -2249,7 +2279,7 @@
       throw new Error("下载译文 PDF 失败：返回内容为空。\n请检查服务端输出文件是否存在。");
     }
 
-    const translatedFileName = "[fastRead 译文] PDF.pdf";
+    const translatedFileName = TRANSLATED_PDF_FILE_NAME;
     const translatedFilePath = joinFilePath(sourceDir, translatedFileName);
 
     setStatus(session, "正在保存译文到原文目录...", "info");
@@ -2312,17 +2342,8 @@
         if (sourcePath) {
           const sourceDir = getParentDirectory(sourcePath);
           if (sourceDir) {
-            const translatedPath = joinFilePath(sourceDir, "[fastRead 译文] PDF.pdf");
-            let exists = false;
-            try {
-              if (typeof IOUtils !== "undefined" && typeof IOUtils.exists === "function") {
-                exists = !!(await IOUtils.exists(translatedPath));
-              }
-            }
-            catch (_error) {
-            }
-
-            if (exists) {
+            const translatedPath = await findExistingTranslatedPdfPath(sourceDir);
+            if (translatedPath) {
               const fileURI = toFileURI(translatedPath);
               if (fileURI) {
                 setStatus(session, "检测到本地译文，跳过翻译...", "info");
@@ -3120,20 +3141,10 @@
 
     const sourceDir = getParentDirectory(sourcePath);
     if (sourceDir) {
-      const translatedPath = joinFilePath(sourceDir, "[fastRead 译文] PDF.pdf");
-
       setStatus(session, "正在检查本地已有译文...", "info");
 
-      let exists = false;
-      try {
-        if (typeof IOUtils !== "undefined" && typeof IOUtils.exists === "function") {
-          exists = !!(await IOUtils.exists(translatedPath));
-        }
-      }
-      catch (_error) {
-      }
-
-      if (exists) {
+      const translatedPath = await findExistingTranslatedPdfPath(sourceDir);
+      if (translatedPath) {
         const fileURI = toFileURI(translatedPath);
         if (fileURI) {
           setStatus(session, "检测到本地译文，正在加载...", "info");

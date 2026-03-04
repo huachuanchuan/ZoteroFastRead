@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import importlib
 import json
@@ -26,7 +27,7 @@ import requests
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 _ORIG_MD5 = hashlib.md5
@@ -76,6 +77,7 @@ DEFAULT_SYSTEM_PROMPT = (
 MAX_PAGE_CHARS = 6000
 
 _BABELDOC_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+_ANTHROPIC_MESSAGES_SUFFIX = "/messages"
 _FASTREAD_BABELDOC_RUNNER_FLAG = "--fastread-babeldoc"
 
 
@@ -91,6 +93,15 @@ class TaskInfo(BaseModel):
     monoOutputPath: Optional[str] = None
     cacheKey: Optional[str] = None
     error: Optional[str] = None
+
+
+class ProviderTestRequest(BaseModel):
+    engine: str = "openai"
+    providerConfigId: Optional[str] = None
+    modelConfig: Dict[str, Any] = Field(default_factory=dict)
+    sourceLang: str = "en"
+    targetLang: str = "zh"
+    text: str = "This is a fastRead provider connectivity test."
 
 
 @asynccontextmanager
@@ -215,10 +226,26 @@ def resolve_endpoint(model_config: Dict[str, Any]) -> str:
         value = str(model_config.get(key_name) or "").strip()
         if value:
             normalized = value.rstrip("/")
+            lower = normalized.lower()
+            if lower.endswith("/apps/anthropic/v1"):
+                return f"{normalized}{_ANTHROPIC_MESSAGES_SUFFIX}"
+            if lower.endswith(_ANTHROPIC_MESSAGES_SUFFIX):
+                return normalized
             if normalized.endswith("/chat/completions"):
                 return normalized
             return f"{normalized}/chat/completions"
     return DEFAULT_ENDPOINT
+
+
+def resolve_endpoint_protocol(endpoint: str) -> str:
+    normalized = str(endpoint or "").strip().rstrip("/").lower()
+    if not normalized:
+        return "openai"
+    if normalized.endswith("/apps/anthropic/v1/messages"):
+        return "anthropic"
+    if "/anthropic/" in normalized and normalized.endswith(_ANTHROPIC_MESSAGES_SUFFIX):
+        return "anthropic"
+    return "openai"
 
 
 def resolve_openai_base_url(endpoint: str) -> str:
@@ -297,6 +324,15 @@ def resolve_babeldoc_max_pages_per_part(page_count: int) -> Optional[str]:
 def should_skip_babeldoc_scanned_detection() -> bool:
     raw = str(os.environ.get("FASTREAD_BABELDOC_SKIP_SCANNED_DETECTION", "")).strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+async def run_blocking_in_thread(func, /, *args, **kwargs):
+    if hasattr(asyncio, "to_thread"):
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    loop = asyncio.get_running_loop()
+    bound = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(None, bound)
 
 
 def _patch_babeldoc_progress_for_headless(babeldoc_main: Any):
@@ -878,6 +914,39 @@ def call_deepseek_translate(
     system_prompt: str,
     text: str,
 ) -> str:
+    endpoint_protocol = resolve_endpoint_protocol(endpoint)
+    if endpoint_protocol == "anthropic":
+        return call_anthropic_translate(
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            system_prompt=system_prompt,
+            text=text,
+        )
+
+    return call_openai_chat_translate(
+        endpoint=endpoint,
+        api_key=api_key,
+        model=model,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        system_prompt=system_prompt,
+        text=text,
+    )
+
+
+def call_openai_chat_translate(
+    *,
+    endpoint: str,
+    api_key: str,
+    model: str,
+    source_lang: str,
+    target_lang: str,
+    system_prompt: str,
+    text: str,
+) -> str:
     user_prompt = (
         f"Translate from {source_lang} to {target_lang}. "
         "Return only the translated text, without explanations.\n\n"
@@ -930,6 +999,79 @@ def call_deepseek_translate(
         last_error = "DeepSeek response content is empty"
 
     raise RuntimeError(f"DeepSeek request failed after retries: {last_error}")
+
+
+def call_anthropic_translate(
+    *,
+    endpoint: str,
+    api_key: str,
+    model: str,
+    source_lang: str,
+    target_lang: str,
+    system_prompt: str,
+    text: str,
+) -> str:
+    user_prompt = (
+        f"Translate from {source_lang} to {target_lang}. "
+        "Return only the translated text, without explanations.\n\n"
+        f"{text}"
+    )
+    payload = {
+        "model": model,
+        "max_tokens": 1024,
+        "system": system_prompt,
+        "messages": [
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    last_error = "Anthropic-compatible request failed"
+    for _attempt in range(3):
+        try:
+            response = requests.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=120,
+            )
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            continue
+
+        if response.status_code in {429, 500, 502, 503, 504}:
+            last_error = f"HTTP {response.status_code} {response.text[:200]}"
+            continue
+
+        if response.status_code >= 400:
+            raise RuntimeError(f"Anthropic-compatible request failed: HTTP {response.status_code} {response.text[:300]}")
+
+        data = response.json()
+        content_items = data.get("content")
+        if isinstance(content_items, list):
+            text_parts: List[str] = []
+            for item in content_items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").strip().lower() != "text":
+                    continue
+                value = str(item.get("text") or "").strip()
+                if value:
+                    text_parts.append(value)
+            if text_parts:
+                return "\n".join(text_parts)
+
+        maybe_completion = str(data.get("completion") or "").strip()
+        if maybe_completion:
+            return maybe_completion
+
+        last_error = "Anthropic-compatible response content is empty"
+
+    raise RuntimeError(f"Anthropic-compatible request failed after retries: {last_error}")
 
 
 def extract_pages_text(pdf_path: Path) -> List[str]:
@@ -991,10 +1133,64 @@ async def health() -> Dict[str, str]:
     return {"status": "ok", "service": "fastread-server"}
 
 
+@app.get("/api/meta")
+async def backend_meta() -> Dict[str, Any]:
+    return {
+        "service": "fastread-server",
+        "apiVersion": "0.3.0",
+        "source": "frozen" if is_frozen_runtime() else "python",
+        "capabilities": [
+            "tasks",
+            "provider_test",
+            "anthropic_messages",
+        ],
+        "supportsProviderTest": True,
+    }
+
+
 @app.post("/shutdown")
 async def shutdown() -> Dict[str, str]:
     os.kill(os.getpid(), signal.SIGTERM)
     return {"status": "shutting_down"}
+
+
+@app.post("/api/providers/test")
+async def test_provider_connection(request: Request, payload: ProviderTestRequest) -> Dict[str, Any]:
+    model_config = payload.modelConfig if isinstance(payload.modelConfig, dict) else {}
+    api_key = read_api_key(request, model_config)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Missing API key. Provide Authorization Bearer or X-API-Key.")
+
+    engine = str(payload.engine or "openai").strip() or "openai"
+    source_lang = str(payload.sourceLang or "en").strip() or "en"
+    target_lang = str(payload.targetLang or "zh").strip() or "zh"
+    endpoint = resolve_endpoint(model_config)
+    model = resolve_model(engine, model_config)
+    system_prompt = resolve_system_prompt(target_lang, model_config)
+    sample_text = str(payload.text or "").strip() or "This is a fastRead provider connectivity test."
+
+    try:
+        translated = await run_blocking_in_thread(
+            call_deepseek_translate,
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            system_prompt=system_prompt,
+            text=sample_text,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Provider connection test failed: {exc}")
+
+    return {
+        "ok": True,
+        "providerConfigId": payload.providerConfigId,
+        "engine": engine,
+        "model": model,
+        "endpoint": endpoint,
+        "preview": str(translated or "").strip()[:200],
+    }
 
 
 @app.get("/api/tasks")
@@ -1147,16 +1343,17 @@ async def run_translation_task(
         task.updated_at = utc_now_iso()
 
         endpoint = resolve_endpoint(model_config)
+        endpoint_protocol = resolve_endpoint_protocol(endpoint)
         model = resolve_model(engine, model_config)
         allow_plain_fallback = _is_true_env("FASTREAD_ALLOW_PLAIN_FALLBACK", False)
-        enable_babeldoc = _is_true_env("FASTREAD_ENABLE_BABELDOC", True)
+        enable_babeldoc = _is_true_env("FASTREAD_ENABLE_BABELDOC", True) and endpoint_protocol == "openai"
         dual_path = output_dir / "dual_output.pdf"
         mono_path = output_dir / "mono_output.pdf"
         preferred_mono: Optional[Path] = None
 
         if enable_babeldoc:
             try:
-                babeldoc_result = await asyncio.to_thread(
+                babeldoc_result = await run_blocking_in_thread(
                     run_babeldoc_translation,
                     input_pdf=upload_path,
                     output_dir=output_dir,
@@ -1172,7 +1369,7 @@ async def run_translation_task(
                     raise RuntimeError(f"BabelDOC translation failed: {babeldoc_error}")
 
         if preferred_mono is None:
-            if not allow_plain_fallback:
+            if endpoint_protocol == "openai" and not allow_plain_fallback:
                 raise RuntimeError("Plain-text fallback translation is disabled by configuration.")
 
             legacy_result = await run_legacy_text_translation_async(
