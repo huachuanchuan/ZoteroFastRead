@@ -22,7 +22,7 @@ const backendArtifactNameByPlatform = {
   darwin: "fastread-server",
 };
 
-const universalRequiredPlatforms = ["win32", "darwin"];
+const universalRequiredPlatforms = ["win32"];
 const universalRequiredArchivePaths = universalRequiredPlatforms
   .map((platform) => backendArchivePathByPlatform[platform])
   .filter(Boolean);
@@ -286,12 +286,10 @@ ensureInputFiles(baseFiles);
 
 let discoveredBackendMembers = discoverBundledBackendsInWorkspace(universalRequiredArchivePaths);
 const currentPlatformArchivePath = backendArchivePathByPlatform[process.platform];
-if (!currentPlatformArchivePath) {
-  fail(`Unsupported platform for backend packaging: ${process.platform}`);
-}
 
 if (
-  universalRequiredArchivePaths.includes(currentPlatformArchivePath)
+  currentPlatformArchivePath
+  && universalRequiredArchivePaths.includes(currentPlatformArchivePath)
   && !discoveredBackendMembers.some((member) => member.archivePath === currentPlatformArchivePath)
 ) {
   const builtCurrentPlatformMember = buildBundledBackend(python);

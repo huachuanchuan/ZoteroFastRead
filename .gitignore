@@ -1,0 +1,13 @@
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+data/outputs/
+data/uploads/
+.build-python-work/
+fastRead-Python.xpi
+Zotero-DeepRead.xpi
+bin/fastread-server.exe
+bin/fastread-server-linux
+bin/fastread-server-macos

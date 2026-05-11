@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "fastRead",
-  "version": "0.1.4",
-  "description": "Moonlight-style split-view PDF translation with coordinate-mapped hover highlights for Zotero 7.",
+  "version": "0.2.0",
+  "description": "Moonlight-style split-view PDF translation with coordinate-mapped hover highlights for Zotero 7/8/9.",
   "icons": {
     "32": "bg.svg",
     "48": "bg.svg",
@@ -13,7 +13,7 @@
       "id": "fastread@example.com",
       "update_url": "https://example.com/fastread/updates.json",
       "strict_min_version": "7.0",
-      "strict_max_version": "7.1.*"
+      "strict_max_version": "9.*"
     }
   }
 }
