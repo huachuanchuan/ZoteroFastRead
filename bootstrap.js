@@ -1,4 +1,29 @@
 const ADDON_ID = "fastread@example.com";
+const FASTREAD_BOOTSTRAP_VERSION = "0.2.14-stable-anchor-cancel-20260529";
+
+function fastReadBootstrapLog(message, level = "debug") {
+  const text = `[fastRead][bootstrap ${FASTREAD_BOOTSTRAP_VERSION}] ${String(message || "")}`;
+  try {
+    if (typeof Zotero !== "undefined" && typeof Zotero.debug === "function") {
+      Zotero.debug(text);
+    }
+  }
+  catch (_error) {
+  }
+
+  try {
+    const targetConsole = typeof console !== "undefined" ? console : null;
+    const method = level === "error" ? "error" : level === "warn" ? "warn" : "debug";
+    if (targetConsole && typeof targetConsole[method] === "function") {
+      targetConsole[method](text);
+    }
+    else if (targetConsole && typeof targetConsole.log === "function") {
+      targetConsole.log(text);
+    }
+  }
+  catch (_error) {
+  }
+}
 
 const PREF_KEYS = Object.freeze({
   syncMode: "extensions.fastread.viewer.syncMode",
@@ -15,7 +40,7 @@ const PREF_KEYS = Object.freeze({
 });
 
 const PREF_DEFAULTS = Object.freeze({
-  [PREF_KEYS.syncMode]: "ratio",
+  [PREF_KEYS.syncMode]: "page",
   [PREF_KEYS.remoteBaseURL]: "",
   [PREF_KEYS.remoteApiKey]: "",
   [PREF_KEYS.remoteProvider]: "deepseek",
@@ -25,7 +50,7 @@ const PREF_DEFAULTS = Object.freeze({
   [PREF_KEYS.remoteTargetLang]: "zh",
   [PREF_KEYS.remoteModelConfig]: "",
   [PREF_KEYS.remotePollIntervalMs]: "700",
-  [PREF_KEYS.remotePollTimeoutSec]: "600"
+  [PREF_KEYS.remotePollTimeoutSec]: "7200"
 });
 
 const AI_PROVIDER_PRESETS = Object.freeze([
@@ -476,23 +501,28 @@ let _backendExtractedExePath = "";
 let _backendManagedByAddon = false;
 let _lastBackendHealthyBaseURL = "";
 const BACKEND_BRIDGE_GLOBAL_NAME = "ZoteroFastReadEnsureLocalBackend";
+const BACKEND_STOP_BRIDGE_GLOBAL_NAME = "ZoteroFastReadStopLocalBackend";
 
 function install() {}
 
 async function startup(addonData) {
   const rawRootURI = String(addonData?.rootURI || "");
   _rootURI = rawRootURI && !rawRootURI.endsWith("/") ? `${rawRootURI}/` : rawRootURI;
+  fastReadBootstrapLog(`startup begin: rootURI=${_rootURI}`);
   installBackendBridge();
   startBackendServerInBackground();
   initializePrefs();
   try {
+    fastReadBootstrapLog("loading reader-script.js");
     Services.scriptloader.loadSubScript(`${_rootURI}reader-script.js`);
     if (!Zotero.FastRead) {
       throw new Error("Zotero.FastRead was not attached.");
     }
+    fastReadBootstrapLog(`reader-script loaded: apiVersion=${Zotero.FastRead.__fastReadScriptVersion || "unknown"}`);
     _readerScriptLoaded = true;
   }
   catch (error) {
+    fastReadBootstrapLog(`failed to load reader-script.js: ${error?.message || error}`, "error");
     Zotero.logError(`Failed to load reader-script.js: ${error}`);
     _readerScriptLoaded = false;
   }
@@ -515,8 +545,10 @@ async function startup(addonData) {
     attachPreferenceWindowHooks();
     attachMainWindowHooks();
     registerReaderHooks();
+    fastReadBootstrapLog("startup hooks attached");
   }
   catch (error) {
+    fastReadBootstrapLog(`failed to attach hooks: ${error?.message || error}`, "error");
     Zotero.logError(`Failed to attach hooks: ${error}`);
   }
 }
@@ -553,14 +585,57 @@ async function uninstall() {
 }
 
 function installBackendBridge() {
-  globalThis[BACKEND_BRIDGE_GLOBAL_NAME] = async function ensureFastReadLocalBackend() {
+  const ensureBridge = async function ensureFastReadLocalBackend() {
     return ensureBackendServerStarted();
   };
+  const stopBridge = async function stopFastReadLocalBackend() {
+    await forceStopBackendServer();
+    return true;
+  };
+
+  try {
+    globalThis[BACKEND_BRIDGE_GLOBAL_NAME] = ensureBridge;
+    globalThis[BACKEND_STOP_BRIDGE_GLOBAL_NAME] = stopBridge;
+  }
+  catch (_error) {
+  }
+
+  try {
+    const mainWin = Zotero.getMainWindow?.() || null;
+    if (mainWin) {
+      mainWin[BACKEND_BRIDGE_GLOBAL_NAME] = ensureBridge;
+      mainWin[BACKEND_STOP_BRIDGE_GLOBAL_NAME] = stopBridge;
+      if (mainWin.wrappedJSObject) {
+        mainWin.wrappedJSObject[BACKEND_BRIDGE_GLOBAL_NAME] = ensureBridge;
+        mainWin.wrappedJSObject[BACKEND_STOP_BRIDGE_GLOBAL_NAME] = stopBridge;
+      }
+    }
+  }
+  catch (_error) {
+  }
 }
 
 function uninstallBackendBridge() {
   try {
     delete globalThis[BACKEND_BRIDGE_GLOBAL_NAME];
+  }
+  catch (_error) {
+  }
+  try {
+    delete globalThis[BACKEND_STOP_BRIDGE_GLOBAL_NAME];
+  }
+  catch (_error) {
+  }
+  try {
+    const mainWin = Zotero.getMainWindow?.() || null;
+    if (mainWin) {
+      delete mainWin[BACKEND_BRIDGE_GLOBAL_NAME];
+      delete mainWin[BACKEND_STOP_BRIDGE_GLOBAL_NAME];
+      if (mainWin.wrappedJSObject) {
+        delete mainWin.wrappedJSObject[BACKEND_BRIDGE_GLOBAL_NAME];
+        delete mainWin.wrappedJSObject[BACKEND_STOP_BRIDGE_GLOBAL_NAME];
+      }
+    }
   }
   catch (_error) {
   }
@@ -1102,6 +1177,48 @@ async function stopBackendServer() {
   }
 }
 
+async function forceStopBackendServer() {
+  const processRef = _backendProcess;
+  _backendProcess = null;
+  _backendProcessObserver = null;
+  _backendManagedByAddon = false;
+  _backendStartPromise = null;
+
+  fastReadBootstrapLog("force stopping local backend after translation cancellation", "warn");
+
+  try {
+    await shutdownExistingLocalBackendServer();
+  }
+  catch (error) {
+    Zotero.debug(`fastRead: backend shutdown request during force stop failed: ${error}`);
+  }
+
+  try {
+    const down = await waitForBackendDown(1800, 150);
+    if (!down && processRef && typeof processRef.kill === "function") {
+      processRef.kill();
+    }
+  }
+  catch (error) {
+    if (processRef && typeof processRef.kill === "function") {
+      try {
+        processRef.kill();
+      }
+      catch (_innerError) {
+      }
+    }
+    Zotero.debug(`fastRead: backend force kill failed or was unnecessary: ${error}`);
+  }
+  finally {
+    try {
+      await waitForBackendDown(2500, 150);
+    }
+    catch (_error) {
+    }
+    cleanupMaterializedBackendExecutable();
+  }
+}
+
 async function waitForBackendHealth(timeoutMs = 25000, intervalMs = 250) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1222,6 +1339,7 @@ function initializePrefs() {
 
   Zotero.Prefs.set("extensions.fastread.viewer.autoLoadTranslatedPdf", "true", true);
   Zotero.Prefs.set("extensions.fastread.viewer.syncEnabled", "true", true);
+  Zotero.Prefs.set(PREF_KEYS.syncMode, "page", true);
   Zotero.Prefs.set("extensions.fastread.remote.autoTranslateOnOpen", "true", true);
   Zotero.Prefs.set("extensions.fastread.remote.engine", "openai", true);
   Zotero.Prefs.set("extensions.fastread.remote.priority", "normal", true);
@@ -1694,6 +1812,37 @@ function buildBatchTranslateDialogNode(doc) {
       color: var(--material-foreground);
     }
 
+    #${FASTREAD_BATCH_DIALOG_ID}.is-minimized {
+      inset: auto 18px 18px auto;
+      width: min(420px, calc(100vw - 36px));
+      height: auto;
+      background: transparent;
+      pointer-events: none;
+      backdrop-filter: none;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID}.is-minimized .zdr-batch-card {
+      width: 100%;
+      max-height: none;
+      pointer-events: auto;
+      cursor: pointer;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID}.is-minimized #zdr-batch-body {
+      display: none !important;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID}.is-minimized .zdr-batch-mini {
+      display: grid;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
     #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-title {
       margin: 0;
       display: flex;
@@ -1701,6 +1850,43 @@ function buildBatchTranslateDialogNode(doc) {
       gap: 8px;
       font-size: 16px;
       font-weight: 700;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-window-btn {
+      width: 26px;
+      height: 26px;
+      min-width: 26px;
+      padding: 0;
+      border-radius: 999px;
+      border: 1px solid color-mix(in srgb, var(--material-foreground) 15%, transparent);
+      background: color-mix(in srgb, var(--material-background) 88%, #ffffff 12%);
+      color: var(--material-foreground);
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-window-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-window-btn.is-close {
+      font-size: 18px;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-window-btn.is-close:hover {
+      background: #d92d45;
+      color: #fff;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-body {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 0;
     }
 
     #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-subtitle {
@@ -1850,12 +2036,45 @@ function buildBatchTranslateDialogNode(doc) {
     #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-item-state.is-error {
       color: #b61c3a;
     }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-mini {
+      display: none;
+      gap: 8px;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-mini p {
+      margin: 0;
+      font-size: 12px;
+      color: color-mix(in srgb, var(--material-foreground) 72%, transparent);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-mini-progress-wrap {
+      height: 6px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: color-mix(in srgb, var(--material-foreground) 12%, transparent);
+    }
+
+    #${FASTREAD_BATCH_DIALOG_ID} .zdr-batch-mini-progress {
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #2f6df6 0%, #46a0ff 100%);
+      transition: width 200ms ease;
+    }
   `;
 
   const card = createHTMLElement(doc, "div");
+  card.id = "zdr-batch-card";
   card.className = "zdr-batch-card";
   card.setAttribute("role", "dialog");
   card.setAttribute("aria-label", "fastRead批量翻译");
+
+  const header = createHTMLElement(doc, "div");
+  header.className = "zdr-batch-header";
 
   const title = createHTMLElement(doc, "h2");
   title.className = "zdr-batch-title";
@@ -1866,6 +2085,34 @@ function buildBatchTranslateDialogNode(doc) {
   icon.setAttribute("height", "16");
   title.appendChild(icon);
   title.appendChild(doc.createTextNode("fastRead批量翻译"));
+
+  const minimizeBtn = createHTMLElement(doc, "button");
+  minimizeBtn.id = "zdr-batch-minimize";
+  minimizeBtn.className = "zdr-batch-window-btn";
+  minimizeBtn.setAttribute("type", "button");
+  minimizeBtn.setAttribute("title", "最小化");
+  minimizeBtn.setAttribute("aria-label", "最小化批量翻译窗口");
+  minimizeBtn.textContent = "−";
+
+  const headerCloseBtn = createHTMLElement(doc, "button");
+  headerCloseBtn.id = "zdr-batch-window-close";
+  headerCloseBtn.className = "zdr-batch-window-btn is-close";
+  headerCloseBtn.setAttribute("type", "button");
+  headerCloseBtn.setAttribute("title", "关闭");
+  headerCloseBtn.setAttribute("aria-label", "关闭批量翻译窗口");
+  headerCloseBtn.textContent = "×";
+
+  const windowActions = createHTMLElement(doc, "div");
+  windowActions.className = "zdr-batch-window-actions";
+  windowActions.appendChild(minimizeBtn);
+  windowActions.appendChild(headerCloseBtn);
+
+  header.appendChild(title);
+  header.appendChild(windowActions);
+
+  const body = createHTMLElement(doc, "div");
+  body.id = "zdr-batch-body";
+  body.className = "zdr-batch-body";
 
   const subtitle = createHTMLElement(doc, "p");
   subtitle.className = "zdr-batch-subtitle";
@@ -1910,14 +2157,7 @@ function buildBatchTranslateDialogNode(doc) {
   startBtn.setAttribute("disabled", "true");
   startBtn.textContent = "开始翻译";
 
-  const closeBtn = createHTMLElement(doc, "button");
-  closeBtn.id = "zdr-batch-close";
-  closeBtn.className = "zdr-batch-btn";
-  closeBtn.setAttribute("type", "button");
-  closeBtn.textContent = "关闭";
-
   actions.appendChild(startBtn);
-  actions.appendChild(closeBtn);
 
   const progressWrap = createHTMLElement(doc, "div");
   progressWrap.id = "zdr-batch-progress-wrap";
@@ -1938,13 +2178,34 @@ function buildBatchTranslateDialogNode(doc) {
   listNode.id = "zdr-batch-list";
   listNode.className = "zdr-batch-list";
 
-  card.appendChild(title);
-  card.appendChild(subtitle);
-  card.appendChild(libraryRow);
-  card.appendChild(actions);
-  card.appendChild(progressWrap);
-  card.appendChild(statusNode);
-  card.appendChild(listNode);
+  const mini = createHTMLElement(doc, "div");
+  mini.id = "zdr-batch-mini";
+  mini.className = "zdr-batch-mini";
+
+  const miniStatus = createHTMLElement(doc, "p");
+  miniStatus.id = "zdr-batch-mini-status";
+  miniStatus.textContent = "等待开始";
+
+  const miniProgressWrap = createHTMLElement(doc, "div");
+  miniProgressWrap.className = "zdr-batch-mini-progress-wrap";
+
+  const miniProgress = createHTMLElement(doc, "div");
+  miniProgress.id = "zdr-batch-mini-progress";
+  miniProgress.className = "zdr-batch-mini-progress";
+  miniProgressWrap.appendChild(miniProgress);
+  mini.appendChild(miniStatus);
+  mini.appendChild(miniProgressWrap);
+
+  body.appendChild(subtitle);
+  body.appendChild(libraryRow);
+  body.appendChild(actions);
+  body.appendChild(progressWrap);
+  body.appendChild(statusNode);
+  body.appendChild(listNode);
+
+  card.appendChild(header);
+  card.appendChild(body);
+  card.appendChild(mini);
 
   overlay.appendChild(styleNode);
   overlay.appendChild(card);
@@ -1982,35 +2243,75 @@ async function openBatchTranslateDialog(win) {
     files: [],
     loading: false,
     running: false,
-    cancelled: false
+    cancelled: false,
+    cancelInProgress: false,
+    savedConfig: null,
+    activeTaskIDs: new Set()
   };
 
   const librarySelect = overlay.querySelector("#zdr-batch-library");
   const reloadBtn = overlay.querySelector("#zdr-batch-reload");
   const selectAllBtn = overlay.querySelector("#zdr-batch-select-all");
   const startBtn = overlay.querySelector("#zdr-batch-start");
-  const closeBtn = overlay.querySelector("#zdr-batch-close");
   const statusNode = overlay.querySelector("#zdr-batch-status");
   const listNode = overlay.querySelector("#zdr-batch-list");
   const progressWrap = overlay.querySelector("#zdr-batch-progress-wrap");
   const progressNode = overlay.querySelector("#zdr-batch-progress");
+  const minimizeBtn = overlay.querySelector("#zdr-batch-minimize");
+  const headerCloseBtn = overlay.querySelector("#zdr-batch-window-close");
+  const miniStatusNode = overlay.querySelector("#zdr-batch-mini-status");
+  const miniProgressNode = overlay.querySelector("#zdr-batch-mini-progress");
+  let batchProgressPercent = 0;
+  let loadSourceSeq = 0;
+  let _minimized = false;
 
   const getSelectedQueue = () => state.files.filter((item) => item.selectable && item.selected);
 
   const setStatus = (text) => {
+    const value = String(text || "");
     if (statusNode) {
-      statusNode.textContent = String(text || "");
+      statusNode.textContent = value;
+    }
+    if (miniStatusNode) {
+      miniStatusNode.textContent = value || "等待开始";
     }
   };
 
   const setProgress = (percent, visible) => {
     const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+    batchProgressPercent = clamped;
     if (progressNode) {
       progressNode.style.width = `${clamped}%`;
+    }
+    if (miniProgressNode) {
+      miniProgressNode.style.width = `${clamped}%`;
     }
     if (progressWrap) {
       progressWrap.style.opacity = visible ? "1" : "0";
     }
+  };
+
+  const toggleMinimize = () => {
+    const card = overlay.querySelector("#zdr-batch-card");
+    if (!card) {
+      return;
+    }
+
+    _minimized = !_minimized;
+
+    if (_minimized) {
+      overlay.classList.add("is-minimized");
+      card.setAttribute("title", "点击展开批量翻译窗口");
+      setProgress(batchProgressPercent, true);
+      if (!state.running) {
+        setStatus("已最小化，点击展开");
+      }
+      return;
+    }
+
+    overlay.classList.remove("is-minimized");
+    card.removeAttribute("title");
+    updateActionButtons();
   };
 
   const renderList = () => {
@@ -2086,10 +2387,10 @@ async function openBatchTranslateDialog(win) {
     const selectedCount = getSelectedQueue().length;
 
     if (librarySelect) {
-      librarySelect.disabled = state.running || state.loading || !state.sources.length;
+      librarySelect.disabled = state.running || !state.sources.length;
     }
     if (reloadBtn) {
-      reloadBtn.disabled = state.running || state.loading || !state.sourceKey;
+      reloadBtn.disabled = state.running || !state.sourceKey;
     }
     if (selectAllBtn) {
       const hasSelectable = state.files.some((item) => item.selectable && !item.selected);
@@ -2100,8 +2401,11 @@ async function openBatchTranslateDialog(win) {
       startBtn.disabled = state.running || state.loading || selectedCount <= 0;
       startBtn.textContent = state.running ? "翻译中..." : "开始翻译";
     }
-    if (closeBtn) {
-      closeBtn.textContent = state.running ? "停止并关闭" : "关闭";
+    if (minimizeBtn) {
+      minimizeBtn.disabled = false;
+      minimizeBtn.textContent = _minimized ? "□" : "−";
+      minimizeBtn.setAttribute("title", _minimized ? "还原" : "最小化");
+      minimizeBtn.setAttribute("aria-label", _minimized ? "还原批量翻译窗口" : "最小化批量翻译窗口");
     }
   };
 
@@ -2120,10 +2424,40 @@ async function openBatchTranslateDialog(win) {
   const closeDialog = () => {
     if (state.running) {
       state.cancelled = true;
+      void cancelBatchAndClose();
       setStatus("正在停止当前任务，请稍候...");
       return;
     }
     closeBatchTranslateDialog(doc);
+  };
+
+  const cancelBatchAndClose = async () => {
+    if (state.cancelInProgress) {
+      return;
+    }
+    state.cancelInProgress = true;
+    state.cancelled = true;
+    setStatus("正在取消翻译任务并停止后台进程，请稍候...", "info");
+    updateActionButtons();
+
+    const taskIDs = state.activeTaskIDs
+      ? Array.from(state.activeTaskIDs.values()).filter(Boolean)
+      : [];
+
+    try {
+      if (state.savedConfig && taskIDs.length) {
+        await Promise.allSettled(taskIDs.map((taskID) => cancelBatchTranslationTask(state.savedConfig, taskID)));
+      }
+      await forceStopBackendServer();
+    }
+    catch (error) {
+      Zotero.debug(`fastRead: batch cancellation cleanup failed: ${error}`);
+    }
+    finally {
+      setStatus("翻译已取消", "info");
+      showConnectionAlert("翻译已取消");
+      closeBatchTranslateDialog(doc);
+    }
   };
 
   const applySelectAllPending = () => {
@@ -2159,6 +2493,8 @@ async function openBatchTranslateDialog(win) {
   };
 
   const loadSourceFiles = async (sourceKey) => {
+    const seq = loadSourceSeq + 1;
+    loadSourceSeq = seq;
     const source = resolveBatchSourceByKey(state.sources, sourceKey);
     state.sourceKey = source?.key || "";
     updateActionButtons();
@@ -2176,6 +2512,9 @@ async function openBatchTranslateDialog(win) {
 
     try {
       const loadedFiles = await listBatchPdfFilesBySource(source);
+      if (seq !== loadSourceSeq || state.sourceKey !== source.key) {
+        return;
+      }
       state.files = loadedFiles;
 
       const translatableCount = loadedFiles.filter((item) => item.selectable).length;
@@ -2188,12 +2527,17 @@ async function openBatchTranslateDialog(win) {
       }
     }
     catch (error) {
+      if (seq !== loadSourceSeq) {
+        return;
+      }
       state.files = [];
       setStatus(`读取文库失败: ${error?.message || error}`);
       Zotero.logError(`fastRead: failed to load library PDFs: ${error}`);
     }
     finally {
-      setLoading(false);
+      if (seq === loadSourceSeq) {
+        setLoading(false);
+      }
     }
   };
 
@@ -2227,6 +2571,8 @@ async function openBatchTranslateDialog(win) {
     }
 
     state.cancelled = false;
+    state.activeTaskIDs.clear();
+    state.savedConfig = null;
     setRunning(true);
     setProgress(0, true);
 
@@ -2241,6 +2587,7 @@ async function openBatchTranslateDialog(win) {
       }
 
       config.baseURL = baseURL;
+      state.savedConfig = config;
       setStatus(`已连接任务服务: ${baseURL}`);
 
       let completedCount = 0;
@@ -2261,9 +2608,24 @@ async function openBatchTranslateDialog(win) {
           renderList();
           setStatus(`正在翻译 ${Math.min(completedCount + 1, queue.length)}/${queue.length}: ${item.fileName}`);
 
+          let activeTaskID = "";
           try {
             const createResult = await submitBatchTranslationTask(config, item);
-            const completedTask = await pollBatchTaskUntilComplete(config, createResult.taskID);
+            activeTaskID = createResult.taskID || "";
+            item.taskID = activeTaskID;
+            if (activeTaskID) {
+              state.activeTaskIDs.add(activeTaskID);
+            }
+            item.stateLabel = "任务已提交，等待服务端";
+            renderList();
+            const completedTask = await pollBatchTaskUntilComplete(config, activeTaskID, () => state.cancelled, ({ progress, stage, status }) => {
+              const pct = Math.max(0, Math.min(100, Math.round(Number(progress) || 0)));
+              item.stateLabel = `${stage || status || "翻译中"} ${pct}%`;
+              renderList();
+              setStatus(`正在翻译 ${Math.min(completedCount + 1, queue.length)}/${queue.length}: ${item.fileName} - ${stage || status || "处理中"} ${pct}%`);
+            });
+            item.stateLabel = "正在下载译文";
+            renderList();
             await downloadBatchTaskOutput(config, item, completedTask);
             item.state = "done";
             item.stateLabel = "完成";
@@ -2273,10 +2635,20 @@ async function openBatchTranslateDialog(win) {
             done += 1;
           }
           catch (error) {
+            if (state.cancelled) {
+              item.state = "pending";
+              item.stateLabel = "已停止";
+              continue;
+            }
             item.state = "error";
             item.stateLabel = `失败: ${truncateForUser(error?.message || String(error || "未知错误"), 36)}`;
             failed += 1;
             Zotero.logError(`fastRead batch translate failed for ${item.filePath}: ${error}`);
+          }
+          finally {
+            if (activeTaskID) {
+              state.activeTaskIDs.delete(activeTaskID);
+            }
           }
 
           completedCount += 1;
@@ -2320,10 +2692,30 @@ async function openBatchTranslateDialog(win) {
   startBtn?.addEventListener("click", () => {
     void startBatchTranslate();
   });
-  closeBtn?.addEventListener("click", closeDialog);
+  minimizeBtn?.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleMinimize();
+  });
+  headerCloseBtn?.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (state.running) {
+      void cancelBatchAndClose();
+      return;
+    }
+    closeDialog();
+  });
+  overlay.querySelector("#zdr-batch-card")?.addEventListener("click", () => {
+    if (_minimized) {
+      toggleMinimize();
+    }
+  });
   overlay.addEventListener("click", (event) => {
-    if (event.target === overlay && !state.running) {
-      closeDialog();
+    if (event.target === overlay) {
+      if (!state.running && !_minimized) {
+        closeDialog();
+      }
     }
   });
 
@@ -2375,22 +2767,34 @@ async function launchFastReadFromSelectedItem(win) {
   }
 
   const itemID = pdfItem.id || pdfItem.itemID;
+  fastReadBootstrapLog(`context-menu launch requested: itemID=${itemID || "(empty)"}, key=${pdfItem.key || ""}`);
   if (!itemID) {
     showConnectionAlert("无法解析 PDF 条目 ID。");
     return;
   }
 
   await Zotero.Reader.open(itemID);
+  fastReadBootstrapLog(`Zotero.Reader.open returned for itemID=${itemID}`);
   await delay(120);
 
   const reader = await waitForReaderByItemID(itemID);
   const doc = reader?._iframeWindow?.document || null;
   if (!reader || !doc) {
+    fastReadBootstrapLog(`reader lookup failed after open: itemID=${itemID}, hasReader=${!!reader}, hasDoc=${!!doc}`, "warn");
     notifyReaderScriptNotReady();
     return;
   }
 
-  launchSplitViewFromSidebar(reader, doc);
+  try {
+    reader._fastReadLaunchItemID = itemID;
+    reader._fastReadLaunchAttachment = pdfItem;
+  }
+  catch (_error) {
+  }
+
+  await waitForReaderPDFSurfaceReady(reader, doc, 40, 100);
+  fastReadBootstrapLog(`launching split view after PDF surface wait: itemID=${itemID}, apiVersion=${Zotero.FastRead?.__fastReadScriptVersion || "unknown"}`);
+  launchSplitViewFromSidebar(reader, reader?._iframeWindow?.document || doc);
 }
 
 async function waitForReaderByItemID(itemID, maxAttempts = 25, intervalMs = 120) {
@@ -2408,27 +2812,57 @@ async function waitForReaderByItemID(itemID, maxAttempts = 25, intervalMs = 120)
   return null;
 }
 
+async function waitForReaderPDFSurfaceReady(reader, doc, maxAttempts = 80, intervalMs = 150) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const activeDoc = reader?._iframeWindow?.document || doc || null;
+    try {
+      const hasViewer = !!(
+        activeDoc?.getElementById?.("viewerContainer")
+        || activeDoc?.querySelector?.(".pdfViewerContainer, .viewerContainer, .page[data-page-number], .page")
+      );
+      const app = activeDoc?.defaultView?.wrappedJSObject?.PDFViewerApplication
+        || activeDoc?.defaultView?.PDFViewerApplication
+        || null;
+      const appReady = !app || app.initialized === true || !!app.pdfViewer;
+      if (hasViewer && appReady) {
+        fastReadBootstrapLog(`reader PDF surface ready: attempt=${attempt + 1}, hasViewer=${hasViewer}, appReady=${appReady}`);
+        return true;
+      }
+    }
+    catch (_error) {
+    }
+    await delay(intervalMs);
+  }
+  fastReadBootstrapLog(`reader PDF surface wait timed out: attempts=${maxAttempts}`, "warn");
+  return false;
+}
+
 function launchSplitViewFromSidebar(reader, doc) {
   if (!reader || !doc) {
+    fastReadBootstrapLog(`launchSplitViewFromSidebar aborted: hasReader=${!!reader}, hasDoc=${!!doc}`, "warn");
     return;
   }
 
   if (!Zotero.FastRead) {
+    fastReadBootstrapLog("launchSplitViewFromSidebar aborted: Zotero.FastRead missing", "error");
     notifyReaderScriptNotReady();
     return;
   }
 
   if (typeof Zotero.FastRead.launchSplitView === "function") {
+    fastReadBootstrapLog(`calling Zotero.FastRead.launchSplitView: apiVersion=${Zotero.FastRead.__fastReadScriptVersion || "unknown"}`);
     Zotero.FastRead.launchSplitView(reader, doc, { autoTrigger: true });
     return;
   }
 
   const readerWindow = reader._iframeWindow || null;
   if (typeof Zotero.FastRead.toggleFastReadForWindow === "function") {
+    fastReadBootstrapLog(`calling Zotero.FastRead.toggleFastReadForWindow: apiVersion=${Zotero.FastRead.__fastReadScriptVersion || "unknown"}`);
     Zotero.FastRead.toggleFastReadForWindow(true, readerWindow, reader, doc);
     return;
   }
 
+  fastReadBootstrapLog("launchSplitViewFromSidebar aborted: no launch API available", "error");
   notifyReaderScriptNotReady();
 }
 
@@ -2443,8 +2877,13 @@ function createTimeoutError(timeoutMs) {
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 2500) {
-  const normalizedTimeout = Math.max(500, Number(timeoutMs) || 2500);
   const requestOptions = { ...(options || {}) };
+  const rawTimeout = Number(timeoutMs);
+  if (Number.isFinite(rawTimeout) && rawTimeout <= 0) {
+    return fetch(url, requestOptions);
+  }
+
+  const normalizedTimeout = Math.max(500, Number.isFinite(rawTimeout) ? rawTimeout : 2500);
 
   if (typeof AbortController === "function") {
     const controller = new AbortController();
@@ -3829,6 +4268,22 @@ function getBatchLibraryName(library) {
   return `文库 ${normalizeLibraryID(library?.libraryID || library?.id)}`;
 }
 
+function normalizeBatchLibraries(value) {
+  if (!value) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.filter(Boolean);
+  }
+  if (typeof value[Symbol.iterator] === "function") {
+    return Array.from(value).filter(Boolean);
+  }
+  if (typeof value === "object") {
+    return Object.values(value).filter(Boolean);
+  }
+  return [];
+}
+
 function buildBatchSourceKey(type, id) {
   return `${String(type || "").trim()}:${Number(id || 0)}`;
 }
@@ -3861,26 +4316,50 @@ function toBatchCollectionLabel(name, level) {
 }
 
 function getBatchLibraries() {
-  const libraries = Array.isArray(Zotero?.Libraries?.getAll?.())
-    ? Zotero.Libraries.getAll()
-    : [];
-
   const byID = new Map();
-  for (const library of libraries) {
-    const libraryID = normalizeLibraryID(library?.libraryID || library?.id);
+
+  const addLibrary = (library, fallbackID = 0, fallbackName = "") => {
+    const libraryID = normalizeLibraryID(library?.libraryID || library?.id || fallbackID);
     if (!libraryID) {
-      continue;
+      return;
     }
 
-    const name = getBatchLibraryName(library);
+    const name = getBatchLibraryName(library || { libraryID, name: fallbackName }) || fallbackName;
     if (!name) {
-      continue;
+      return;
     }
 
     byID.set(libraryID, {
       libraryID,
       name
     });
+  };
+
+  let libraries = [];
+  try {
+    libraries = normalizeBatchLibraries(Zotero?.Libraries?.getAll?.());
+  }
+  catch (error) {
+    Zotero.logError(`fastRead: failed to enumerate Zotero libraries: ${error}`);
+  }
+
+  for (const library of libraries) {
+    addLibrary(library);
+  }
+
+  const userLibraryID = normalizeLibraryID(
+    Zotero?.Libraries?.userLibraryID
+    || Zotero?.Libraries?.userLibrary?.libraryID
+    || Zotero?.Libraries?.userLibrary?.id
+  );
+  if (userLibraryID && !byID.has(userLibraryID)) {
+    let userLibrary = Zotero?.Libraries?.userLibrary || null;
+    try {
+      userLibrary = userLibrary || Zotero?.Libraries?.get?.(userLibraryID) || null;
+    }
+    catch (_error) {
+    }
+    addLibrary(userLibrary || { libraryID: userLibraryID, libraryType: "user" }, userLibraryID, "我的文库");
   }
 
   return Array.from(byID.values()).sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
@@ -4374,7 +4853,7 @@ async function listBatchPdfFilesBySource(source) {
 
 function getBatchTranslateConfig() {
   const intervalMs = Math.max(500, Number(readPref(PREF_KEYS.remotePollIntervalMs)) || 1500);
-  const timeoutSec = Math.max(30, Number(readPref(PREF_KEYS.remotePollTimeoutSec)) || 600);
+  const timeoutSec = Math.max(7200, Number(readPref(PREF_KEYS.remotePollTimeoutSec)) || 7200);
   const activeSelection = resolveActiveModelSelection(
     readPref(PREF_KEYS.remoteModelConfig),
     readPref(PREF_KEYS.remoteActiveModelId),
@@ -4480,6 +4959,26 @@ function buildBatchDetailTaskURL(baseURL, taskID) {
   return `${normalized}/api/tasks/${encodedID}`;
 }
 
+async function cancelBatchTranslationTask(config, taskID) {
+  const detailURL = buildBatchDetailTaskURL(config?.baseURL, taskID);
+  if (!detailURL) {
+    return false;
+  }
+
+  try {
+    const response = await fetchWithTimeout(detailURL, {
+      method: "DELETE",
+      headers: buildBatchRemoteHeaders(config),
+      credentials: "include"
+    }, 2500);
+    return response.ok;
+  }
+  catch (error) {
+    Zotero.debug(`fastRead: failed to cancel batch task ${taskID}: ${error}`);
+    return false;
+  }
+}
+
 function sanitizeMultipartToken(value) {
   return String(value || "").replace(/["\r\n]/g, "_");
 }
@@ -4574,6 +5073,17 @@ function extractTaskID(payload) {
 function extractTaskStatus(payload) {
   const task = payload?.task || payload?.data?.task || payload?.data || payload || {};
   return String(task?.status || "").trim().toLowerCase();
+}
+
+function extractTaskProgress(payload) {
+  const task = payload?.task || payload?.data?.task || payload?.data || payload || {};
+  const value = Number(task?.progress || task?.progressPct || task?.progress_pct || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function extractTaskStage(payload) {
+  const task = payload?.task || payload?.data?.task || payload?.data || payload || {};
+  return String(task?.stage || task?.stageLabel || task?.message || "").trim();
 }
 
 function extractTaskError(payload) {
@@ -4694,7 +5204,7 @@ async function submitBatchTranslationTask(config, fileInfo) {
   throw new Error("创建翻译任务失败：未找到可用任务服务地址。");
 }
 
-async function pollBatchTaskUntilComplete(config, taskID) {
+async function pollBatchTaskUntilComplete(config, taskID, shouldCancel = null, onProgress = null) {
   const detailURL = buildBatchDetailTaskURL(config?.baseURL, taskID);
   if (!detailURL) {
     throw new Error("任务详情 URL 无效。");
@@ -4703,6 +5213,11 @@ async function pollBatchTaskUntilComplete(config, taskID) {
   const startedAt = Date.now();
   const detailRequestTimeoutMs = resolveBatchDetailRequestTimeoutMs(config);
   while (Date.now() - startedAt < config.pollTimeoutMs) {
+    if (typeof shouldCancel === "function" && shouldCancel()) {
+      await cancelBatchTranslationTask(config, taskID);
+      throw new Error("batch task cancelled");
+    }
+
     const response = await fetchWithTimeout(`${detailURL}?_ts=${Date.now()}`, {
       method: "GET",
       headers: buildBatchRemoteHeaders(config),
@@ -4716,6 +5231,17 @@ async function pollBatchTaskUntilComplete(config, taskID) {
     }
 
     const status = extractTaskStatus(payload);
+    if (typeof onProgress === "function") {
+      try {
+        onProgress({
+          progress: extractTaskProgress(payload),
+          stage: extractTaskStage(payload),
+          status
+        });
+      }
+      catch (_error) {
+      }
+    }
     if (status === "completed") {
       return payload;
     }

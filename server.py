@@ -1,17 +1,43 @@
 from __future__ import annotations
 
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _resolve_startup_log_path() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "fastread" / "data" / "startup.log"
+        return Path.home() / "AppData" / "Local" / "fastread" / "data" / "startup.log"
+    return Path(__file__).resolve().parent / "data" / "startup.log"
+
+
+def _startup_log(message: str) -> None:
+    try:
+        path = _resolve_startup_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {message}\n")
+    except Exception:
+        pass
+
+
+_startup_log("module import start")
+
 import asyncio
 import functools
 import hashlib
 import importlib
 import json
-import os
 import re
 import signal
 import shutil
 import socket
 import subprocess
-import sys
 import threading
 import textwrap
 import uuid
@@ -19,9 +45,9 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+_startup_log("stdlib imports complete")
 
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -29,6 +55,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
+
+_startup_log("web/pdf imports complete")
 
 _ORIG_MD5 = hashlib.md5
 try:
@@ -44,6 +72,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
+
+_startup_log("reportlab imports complete")
 
 
 if sys.stdout is None:
@@ -106,12 +136,14 @@ class ProviderTestRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    _startup_log("lifespan startup begin")
     ensure_dirs()
     try:
         pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
     except Exception:
         # Continue with fallback font if CID font registration fails.
         pass
+    _startup_log("lifespan startup complete")
     yield
 
 
@@ -138,6 +170,10 @@ def utc_now_iso() -> str:
 def ensure_dirs() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        (Path.home() / ".cache" / "babeldoc").mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 
 def compute_pdf_hash(path: Path) -> str:
@@ -1353,6 +1389,8 @@ async def run_translation_task(
 
         if enable_babeldoc:
             try:
+                if task.status == "cancelled":
+                    return
                 babeldoc_result = await run_blocking_in_thread(
                     run_babeldoc_translation,
                     input_pdf=upload_path,
@@ -1367,6 +1405,9 @@ async def run_translation_task(
             except Exception as babeldoc_error:
                 if not allow_plain_fallback:
                     raise RuntimeError(f"BabelDOC translation failed: {babeldoc_error}")
+
+        if task.status == "cancelled":
+            return
 
         if preferred_mono is None:
             if endpoint_protocol == "openai" and not allow_plain_fallback:
@@ -1385,8 +1426,14 @@ async def run_translation_task(
             if not preferred_mono:
                 raise RuntimeError("Legacy translation failed: missing output PDF path")
 
+        if task.status == "cancelled":
+            return
+
         sanitize_pdf_for_zotero(preferred_mono, mono_path)
         mirror_pdf_output(mono_path, dual_path)
+
+        if task.status == "cancelled":
+            return
 
         base_url = trim_trailing_slash(public_base_url) or "http://127.0.0.1:8000"
         task.dualOutputUrl = f"{base_url}/files/{task_id}/dual_output.pdf"
@@ -1396,6 +1443,8 @@ async def run_translation_task(
         task.status = "completed"
         task.updated_at = utc_now_iso()
     except Exception as exc:  # noqa: BLE001
+        if task.status == "cancelled":
+            return
         task.status = "failed"
         task.error = str(exc)
         task.updated_at = utc_now_iso()
@@ -1409,6 +1458,24 @@ async def get_task(task_id: str) -> Dict[str, Any]:
     task = TASKS.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    return task.model_dump()
+
+
+@app.delete("/api/tasks/{task_id}")
+async def cancel_task(task_id: str) -> Dict[str, Any]:
+    task = TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status not in {"completed", "failed", "cancelled", "canceled"}:
+        task.status = "cancelled"
+        task.error = "Cancelled by client"
+        task.updated_at = utc_now_iso()
+
+    cache_key = str(task.cacheKey or "").strip()
+    if cache_key and TASK_KEY_CACHE.get(cache_key) == task_id:
+        TASK_KEY_CACHE.pop(cache_key, None)
+
     return task.model_dump()
 
 
@@ -1433,12 +1500,20 @@ async def get_output_file(task_id: str, filename: str) -> FileResponse:
 
 
 if __name__ == "__main__":
+    _startup_log(f"main entered frozen={bool(getattr(sys, 'frozen', False))} argv={sys.argv!r}")
+    try:
+        import multiprocessing as mp
+
+        mp.freeze_support()
+        _startup_log("multiprocessing freeze_support complete")
+    except Exception as exc:  # noqa: BLE001
+        _startup_log(f"multiprocessing freeze_support failed: {exc!r}")
+
     if _FASTREAD_BABELDOC_RUNNER_FLAG in sys.argv:
+        _startup_log("babeldoc runner mode begin")
         babeldoc_args = [arg for arg in sys.argv[1:] if arg != _FASTREAD_BABELDOC_RUNNER_FLAG]
         sys.argv = ["babeldoc", *babeldoc_args]
         try:
-            import multiprocessing as mp
-
             try:
                 if sys.platform in {"darwin", "win32"}:
                     mp.set_start_method("spawn")
@@ -1461,22 +1536,29 @@ if __name__ == "__main__":
             raise SystemExit(1)
 
     import uvicorn
+    _startup_log("uvicorn import complete")
 
     def pick_bind_port() -> int:
         env_port = os.environ.get("FASTREAD_PORT", "").strip()
         if env_port.isdigit():
+            _startup_log(f"using env port {env_port}")
             return int(env_port)
 
         for candidate in (8000, 18000, 28000, 38000):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 sock.bind(("127.0.0.1", candidate))
+                _startup_log(f"selected port {candidate}")
                 return candidate
             except OSError:
+                _startup_log(f"port unavailable {candidate}")
                 continue
             finally:
                 sock.close()
 
+        _startup_log("falling back to port 18000")
         return 18000
 
-    uvicorn.run(app, host="127.0.0.1", port=pick_bind_port(), reload=False)
+    selected_port = pick_bind_port()
+    _startup_log(f"starting uvicorn port={selected_port}")
+    uvicorn.run(app, host="127.0.0.1", port=selected_port, reload=False)

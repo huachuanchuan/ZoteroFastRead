@@ -1,7 +1,47 @@
 (function() {
+  const FASTREAD_READER_SCRIPT_VERSION = "0.2.14-stable-anchor-cancel-20260529";
+  const FASTREAD_DEBUG_PREFIX = `[fastRead][reader ${FASTREAD_READER_SCRIPT_VERSION}]`;
+
+  function fastReadLog(message, level = "debug") {
+    const text = `${FASTREAD_DEBUG_PREFIX} ${String(message || "")}`;
+    try {
+      if (typeof Zotero !== "undefined" && typeof Zotero.debug === "function") {
+        Zotero.debug(text);
+      }
+    }
+    catch (_error) {
+    }
+
+    try {
+      const targetConsole = typeof console !== "undefined" ? console : null;
+      const method = level === "error" ? "error" : level === "warn" ? "warn" : "debug";
+      if (targetConsole && typeof targetConsole[method] === "function") {
+        targetConsole[method](text);
+      }
+      else if (targetConsole && typeof targetConsole.log === "function") {
+        targetConsole.log(text);
+      }
+    }
+    catch (_error) {
+    }
+  }
+
   if (Zotero.FastRead) {
-    Zotero.debug("[fastRead] Zotero.FastRead already exists, skipping reload.");
-    return;
+    fastReadLog(`existing Zotero.FastRead detected (version=${Zotero.FastRead.__fastReadScriptVersion || "unknown"}); replacing it.`);
+    try {
+      if (typeof Zotero.FastRead.teardownAll === "function") {
+        Zotero.FastRead.teardownAll();
+      }
+    }
+    catch (error) {
+      fastReadLog(`teardown of existing API failed before reload: ${String(error?.message || error)}`, "warn");
+    }
+    try {
+      delete Zotero.FastRead;
+    }
+    catch (_error) {
+      Zotero.FastRead = null;
+    }
   }
 
   const PREF_KEYS = Object.freeze({
@@ -35,6 +75,7 @@
   const TRANSLATED_SYNC_BADGE_ID = "zdr-sync-badge";
   const TRANSLATED_FRAME_ID = "zdr-translated-pdf-frame";
   const TRANSLATED_PLACEHOLDER_ID = "zdr-translated-placeholder";
+  const TOGGLE_ORIGINAL_BUTTON_ID = "zdr-toggle-original-btn";
   const INTERNAL_READER_FRAME_URL = "resource://zotero/reader/reader.html";
   const LOCAL_REMOTE_BASE_URL_CANDIDATES = Object.freeze([
     "http://127.0.0.1:8000",
@@ -90,6 +131,7 @@
       translatedLoadButton: null,
       translatedFrame: null,
       translatedPlaceholder: null,
+      originalHidden: false,
       translatedViewerContainer: null,
       translatedScrollRoot: null,
       leftScrollRoot: null,
@@ -98,7 +140,17 @@
       scrollSyncReleaseTimer: 0,
       leftScrollRAF: 0,
       rightScrollRAF: 0,
+      syncPollInterval: 0,
+      syncRetryTimer: 0,
+      _syncPollWindow: null,
+      _syncRetryWindow: null,
+      _lastLeftScrollTop: 0,
+      _lastLeftScrollLeft: 0,
+      _lastRightScrollTop: 0,
+      _lastRightScrollLeft: 0,
       suppressSyncUntil: 0,
+      _leftSuppressUntil: 0,
+      _rightSuppressUntil: 0,
       scaleSyncSource: "",
       scaleSyncReleaseTimer: 0,
       suppressScaleSyncUntil: 0,
@@ -108,11 +160,19 @@
       _rightZoomListener: null,
       _leftEventBus: null,
       _rightEventBus: null,
+      _leftViewListener: null,
+      _rightViewListener: null,
+      _leftViewEventBus: null,
+      _rightViewEventBus: null,
       remoteTaskID: null,
       remoteTaskPolling: false,
+      remoteTaskConfig: null,
+      _translationCancelRequested: false,
       sidebarWorkflowStarted: false,
       translatedLoadRetryCount: 0,
-      translatedLoadToken: 0
+      translatedLoadToken: 0,
+      translatedFrameResetCount: 0,
+      translationProgress: 0
     };
 
     _sessions.add(session);
@@ -132,6 +192,10 @@
     }
 
     toggleFastReadMode(session, true).catch((error) => {
+      if (isCancellationLikeError(session, error)) {
+        showReaderAlert("翻译服务已取消");
+        return;
+      }
       Zotero.logError(error);
     });
     return true;
@@ -147,6 +211,7 @@
     if (!session || session.destroyed) {
       return;
     }
+    void cancelActiveTranslation(session, { forceBackend: true, notify: true });
     session.destroyed = true;
     session.translatedLoadToken = Number(session.translatedLoadToken || 0) + 1;
 
@@ -279,7 +344,7 @@
     const candidates = Array.from(doc.querySelectorAll("iframe, browser"));
     for (const frame of candidates) {
       try {
-        const frameDoc = frame.contentDocument;
+        const frameDoc = frame.contentDocument || frame.contentWindow?.document || null;
         if (!frameDoc) {
           continue;
         }
@@ -294,15 +359,23 @@
     return null;
   }
 
+  function getDocumentFromFrameLike(node) {
+    try {
+      const tag = String(node?.tagName || "").toLowerCase();
+      if (tag !== "iframe" && tag !== "browser") {
+        return null;
+      }
+      return node.contentDocument || node.contentWindow?.document || null;
+    }
+    catch (_error) {
+      return null;
+    }
+  }
+
   function resolvePDFDocFromLeftPane(leftPane, hostDoc) {
-    const tag = String(leftPane?.tagName || "").toLowerCase();
-    if (tag === "iframe" || tag === "browser") {
-      try {
-        return leftPane.contentDocument || hostDoc;
-      }
-      catch (_error) {
-        return hostDoc;
-      }
+    const frameDoc = getDocumentFromFrameLike(leftPane);
+    if (frameDoc) {
+      return frameDoc;
     }
     return hostDoc;
   }
@@ -344,12 +417,18 @@
       </div>
       <div id="${STATUS_ID}" style="display:none;"></div>
       <div id="${BODY_ID}" class="zdr-panel-body">
+        <button id="${TOGGLE_ORIGINAL_BUTTON_ID}" class="zdr-original-toggle" type="button" title="隐藏原文">隐藏原文</button>
         <div id="${TRANSLATED_PLACEHOLDER_ID}" class="zdr-translated-placeholder">
           <div class="zdr-wait-card">
             <div class="zdr-wait-spinner" aria-hidden="true"></div>
             <h3 class="zdr-wait-title">等待译文加载</h3>
             <p class="zdr-wait-subtitle">正在连接本地翻译服务，完成后会自动显示译文 PDF。</p>
-            <div class="zdr-wait-pulse" aria-hidden="true"></div>
+            <div class="zdr-single-progress" aria-live="polite">
+              <p class="zdr-single-progress-label">准备中 0%</p>
+              <div class="zdr-single-progress-track" aria-hidden="true">
+                <div class="zdr-single-progress-bar"></div>
+              </div>
+            </div>
           </div>
         </div>
         <iframe id="${TRANSLATED_FRAME_ID}" class="zdr-translated-frame" title="Translated PDF" loading="eager"></iframe>
@@ -372,12 +451,18 @@
       </div>
       <div id="${STATUS_ID}" style="display:none;"></div>
       <div id="${BODY_ID}" class="zdr-panel-body">
+        <button id="${TOGGLE_ORIGINAL_BUTTON_ID}" class="zdr-original-toggle" type="button" title="隐藏原文">隐藏原文</button>
         <div id="${TRANSLATED_PLACEHOLDER_ID}" class="zdr-translated-placeholder">
           <div class="zdr-wait-card">
             <div class="zdr-wait-spinner" aria-hidden="true"></div>
             <h3 class="zdr-wait-title">等待译文加载</h3>
             <p class="zdr-wait-subtitle">正在连接本地翻译服务，完成后会自动显示译文 PDF。</p>
-            <div class="zdr-wait-pulse" aria-hidden="true"></div>
+            <div class="zdr-single-progress" aria-live="polite">
+              <p class="zdr-single-progress-label">准备中 0%</p>
+              <div class="zdr-single-progress-track" aria-hidden="true">
+                <div class="zdr-single-progress-bar"></div>
+              </div>
+            </div>
           </div>
         </div>
         <iframe id="${TRANSLATED_FRAME_ID}" class="zdr-translated-frame" title="Translated PDF" loading="eager"></iframe>
@@ -412,8 +497,8 @@
 
     session.doc = doc;
     session.panel = sidebarPanel;
-    session.leftPane = findViewerContainer(doc) || doc.scrollingElement || doc.documentElement || doc.body || null;
-    session.leftPDFDoc = doc;
+    session.leftPane = findViewerContainer(doc) || findEmbeddedViewerFrame(doc) || doc.scrollingElement || doc.documentElement || doc.body || null;
+    session.leftPDFDoc = resolvePDFDocFromLeftPane(session.leftPane, doc);
     session.statusNode = sidebarPanel.querySelector(`#${STATUS_ID}`);
     session.bodyNode = sidebarPanel.querySelector(`#${BODY_ID}`);
     session.fastReadEnabled = true;
@@ -427,6 +512,14 @@
         await autoLoadTranslatedPDFIfNeeded(session);
       }
       catch (error) {
+        if (isCancellationLikeError(session, error)) {
+          try {
+            setStatus(session, "翻译服务已取消", "info");
+          }
+          catch (_innerError) {
+          }
+          return;
+        }
         setStatus(session, `自动加载失败: ${getSafeErrorText(error)}`, "error");
         Zotero.logError(error);
       }
@@ -464,6 +557,19 @@
         padding: 0 !important;
         border: 0 !important;
         box-shadow: none !important;
+      }
+
+      #${SPLIT_ROOT_ID}.zdr-original-hidden > .zdr-left-pane {
+        display: none !important;
+        flex: 0 0 0 !important;
+        max-width: 0 !important;
+        width: 0 !important;
+      }
+
+      #${SPLIT_ROOT_ID}.zdr-original-hidden > #${PANEL_ID} {
+        flex: 1 1 100% !important;
+        max-width: 100% !important;
+        width: 100% !important;
       }
 
       #${SPLIT_ROOT_ID} > .zdr-left-pane iframe,
@@ -613,6 +719,28 @@
         position: relative;
       }
 
+      #${BODY_ID} .zdr-original-toggle {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        z-index: 20;
+        border: 1px solid color-mix(in srgb, var(--material-foreground) 14%, transparent);
+        border-radius: 8px;
+        background: color-mix(in srgb, var(--material-background) 92%, #ffffff 8%);
+        color: var(--material-foreground);
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1;
+        padding: 7px 10px;
+      }
+
+      #${BODY_ID} .zdr-original-toggle:hover {
+        border-color: color-mix(in srgb, #2f6df6 45%, transparent);
+        background: color-mix(in srgb, #2f6df6 10%, var(--material-background));
+      }
+
       #${BODY_ID} .zdr-translated-placeholder {
         position: absolute;
         inset: 0;
@@ -669,22 +797,35 @@
         color: color-mix(in srgb, var(--material-foreground) 62%, transparent);
       }
 
-      #${BODY_ID} .zdr-wait-pulse {
-        height: 5px;
-        border-radius: 999px;
-        background: color-mix(in srgb, var(--material-foreground) 10%, transparent);
-        overflow: hidden;
-        position: relative;
+      #${BODY_ID} .zdr-single-progress {
+        display: grid;
+        gap: 6px;
       }
 
-      #${BODY_ID} .zdr-wait-pulse::before {
-        content: "";
-        position: absolute;
-        inset: 0;
-        width: 42%;
+      #${BODY_ID} .zdr-single-progress-label {
+        margin: 0;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+        font-weight: 600;
+        color: color-mix(in srgb, var(--material-foreground) 68%, transparent);
+      }
+
+      #${BODY_ID} .zdr-single-progress-track {
+        height: 7px;
+        border-radius: 999px;
+        overflow: hidden;
+        background: color-mix(in srgb, var(--material-foreground) 12%, transparent);
+      }
+
+      #${BODY_ID} .zdr-single-progress-bar {
+        width: 0%;
+        height: 100%;
         border-radius: inherit;
-        background: linear-gradient(90deg, #2f6df6, #8fb0ff);
-        animation: zdr-loading-progress 1.15s ease-in-out infinite;
+        background: linear-gradient(90deg, #2f6df6 0%, #46a0ff 100%);
+        transition: width 200ms ease;
       }
 
       #${BODY_ID} .zdr-translated-placeholder[data-zdr-state="error"] .zdr-wait-card {
@@ -708,10 +849,6 @@
 
       #${BODY_ID} .zdr-translated-placeholder[data-zdr-state="error"] .zdr-wait-subtitle {
         color: color-mix(in srgb, #8b2438 72%, transparent);
-      }
-
-      #${BODY_ID} .zdr-translated-placeholder[data-zdr-state="error"] .zdr-wait-pulse::before {
-        background: linear-gradient(90deg, #d44a61, #f08a9c);
       }
 
       #${BODY_ID} .zdr-translated-frame {
@@ -907,9 +1044,50 @@
         box-shadow: none !important;
         background: transparent !important;
       }
+
+      #viewerContainer,
+      #viewer,
+      .pdfViewer,
+      .pdfViewer .page,
+      .textLayer,
+      .textLayer span {
+        pointer-events: auto !important;
+        user-select: text !important;
+        -moz-user-select: text !important;
+        cursor: text;
+      }
     `;
     }
     catch (_error) {
+    }
+  }
+
+  function applyOriginalVisibility(session) {
+    const hidden = !!session?.originalHidden;
+    try {
+      session?.splitRoot?.classList?.toggle("zdr-original-hidden", hidden);
+    }
+    catch (_error) {
+    }
+
+    try {
+      if (session?.leftPane?.style) {
+        session.leftPane.style.display = hidden ? "none" : "";
+      }
+      if (session?.panel?.style && session?.splitRoot) {
+        session.panel.style.flexBasis = hidden ? "100%" : "";
+        session.panel.style.maxWidth = hidden ? "100%" : "";
+        session.panel.style.width = hidden ? "100%" : "";
+      }
+    }
+    catch (_error) {
+    }
+
+    const button = session?.panel?.querySelector?.(`#${TOGGLE_ORIGINAL_BUTTON_ID}`);
+    if (button) {
+      button.textContent = hidden ? "显示原文" : "隐藏原文";
+      button.setAttribute("title", hidden ? "显示原文" : "隐藏原文");
+      button.setAttribute("aria-pressed", hidden ? "true" : "false");
     }
   }
 
@@ -920,6 +1098,7 @@
 
     const loadButton = session.panel.querySelector(`#${TRANSLATED_LOAD_BUTTON_ID}`);
     const urlInput = session.panel.querySelector(`#${TRANSLATED_URL_INPUT_ID}`);
+    const toggleOriginalButton = session.panel.querySelector(`#${TOGGLE_ORIGINAL_BUTTON_ID}`);
     const frame = session.panel.querySelector(`#${TRANSLATED_FRAME_ID}`);
     const placeholder = session.panel.querySelector(`#${TRANSLATED_PLACEHOLDER_ID}`);
 
@@ -928,6 +1107,27 @@
     session.translatedFrame = frame;
     session.translatedPlaceholder = placeholder;
     setPlaceholderState(session, "loading");
+    applyOriginalVisibility(session);
+
+    if (toggleOriginalButton && !toggleOriginalButton.dataset.zdrBound) {
+      toggleOriginalButton.dataset.zdrBound = "1";
+      toggleOriginalButton.addEventListener("click", () => {
+        session.originalHidden = !session.originalHidden;
+        applyOriginalVisibility(session);
+        if (session.fastReadEnabled && session.translatedFrame?.classList?.contains("is-ready")) {
+          detachSync(session);
+          if (!session.originalHidden) {
+            try {
+              setupSync(session);
+            }
+            catch (error) {
+              Zotero.logError(`[fastRead] setupSync after original toggle failed: ${getSafeErrorText(error)}`);
+              updateSyncBadge(session, "Sync: error");
+            }
+          }
+        }
+      });
+    }
 
     if (session.translatedLoadButton && !session.translatedLoadButton.dataset.zdrBound) {
       session.translatedLoadButton.dataset.zdrBound = "1";
@@ -950,6 +1150,14 @@
           }
         }
         catch (error) {
+          if (session._translationCancelRequested || session.destroyed) {
+            setStatus(session, "翻译服务已取消", "info");
+            return;
+          }
+          if (isDeadObjectError(error)) {
+            showReaderAlert("翻译服务已取消");
+            return;
+          }
           setStatus(session, `加载失败: ${getSafeErrorText(error)}`, "error");
           Zotero.logError(error);
         }
@@ -993,7 +1201,7 @@
 
   function getSyncMode() {
     const value = readPref(PREF_KEYS.syncMode).toLowerCase();
-    return value === "page" ? "page" : "ratio";
+    return value === "ratio" ? "ratio" : "page";
   }
 
   function resolveTranslatedPdfURL(session) {
@@ -1082,6 +1290,40 @@
     session.translatedBlobURL = "";
   }
 
+  function resetTranslatedFrame(session) {
+    const oldFrame = session?.translatedFrame;
+    const doc = oldFrame?.ownerDocument || session?.doc || null;
+    if (!oldFrame || !doc || !oldFrame.parentElement) {
+      return false;
+    }
+
+    try {
+      oldFrame.removeAttribute("src");
+      oldFrame.src = "about:blank";
+    }
+    catch (_error) {
+    }
+
+    const nextFrame = doc.createElement("iframe");
+    nextFrame.id = TRANSLATED_FRAME_ID;
+    nextFrame.className = "zdr-translated-frame";
+    nextFrame.setAttribute("title", "Translated PDF");
+    nextFrame.setAttribute("loading", "eager");
+    oldFrame.parentElement.replaceChild(nextFrame, oldFrame);
+
+    try {
+      session.translatedInternalReader?.destroy?.();
+    }
+    catch (_error) {
+    }
+    session.translatedInternalReader = null;
+    session.translatedReaderWindow = null;
+    session.translatedFrame = nextFrame;
+    session.translatedFrameResetCount = Number(session.translatedFrameResetCount || 0) + 1;
+    fastReadLog(`translated iframe reset; resetCount=${session.translatedFrameResetCount}`);
+    return true;
+  }
+
   async function probeTranslatedURLStatus(url) {
     const target = String(url || "").trim();
     if (!target) {
@@ -1145,6 +1387,7 @@
     if (typeof Zotero?.debug === "function") {
       Zotero.debug(`[fastRead] loading translated frame: ${sourceURL}`);
     }
+    fastReadLog(`loading translated iframe source: ${sourceURL}, timeout=${timeoutMs}`);
     await new Promise((resolve, reject) => {
       let settled = false;
       const win = frame.ownerDocument?.defaultView || globalThis;
@@ -1182,6 +1425,7 @@
         if (typeof Zotero?.debug === "function") {
           Zotero.debug(`[fastRead] translated frame loaded: ${sourceURL}`);
         }
+        fastReadLog(`translated iframe load event received: ${sourceURL}`);
         resolve();
       };
       const onError = () => {
@@ -1193,6 +1437,7 @@
           win?.clearTimeout?.(timer);
         }
         cleanup();
+        fastReadLog(`translated iframe error event: ${sourceURL}`, "error");
         reject(new Error(`Network or viewer load error (${sourceURL})`));
       };
 
@@ -1204,6 +1449,7 @@
 
   async function waitForTranslatedCreateReader(frame, timeoutMs = 10000, intervalMs = 100) {
     const startedAt = Date.now();
+    let lastLoggedAt = 0;
     while (Date.now() - startedAt <= timeoutMs) {
       if (!frame || !frame.contentWindow || frame.isConnected === false) {
         throw new Error("Translated frame unavailable while waiting for createReader");
@@ -1212,7 +1458,13 @@
       const iframeWindow = frame.contentWindow;
       const wrappedWindow = iframeWindow.wrappedJSObject || iframeWindow;
       if (typeof wrappedWindow?.createReader === "function") {
+        fastReadLog(`createReader became available after ${Date.now() - startedAt}ms`);
         return iframeWindow;
+      }
+
+      if (Date.now() - lastLoggedAt > 1000) {
+        lastLoggedAt = Date.now();
+        fastReadLog(`waiting for createReader... elapsed=${Date.now() - startedAt}ms`);
       }
 
       await delay(intervalMs);
@@ -1437,6 +1689,39 @@
     }
   }
 
+  function enablePDFTextSelection(target) {
+    let win = null;
+    let doc = null;
+    try {
+      win = target?.defaultView
+        ? target.defaultView
+        : target?.contentWindow
+          || target?._iframeWindow
+          || target
+          || null;
+      const wrappedWin = win?.wrappedJSObject || win;
+      doc = wrappedWin?.document || target?.ownerDocument || null;
+      if (doc) {
+        injectViewerChromeStyle(doc);
+      }
+
+      const app = wrappedWin?.PDFViewerApplication || null;
+      const cursorTools = app?.pdfCursorTools || app?.pdfViewer?.pdfCursorTools || null;
+      if (cursorTools && typeof cursorTools.switchTool === "function") {
+        cursorTools.switchTool(0);
+      }
+      if (app?.eventBus && typeof app.eventBus.dispatch === "function") {
+        app.eventBus.dispatch("switchcursortool", {
+          source: app,
+          tool: 0
+        });
+      }
+    }
+    catch (error) {
+      fastReadLog(`enablePDFTextSelection failed: ${getSafeErrorText(error)}`, "warn");
+    }
+  }
+
   async function resolveTranslatedAttachmentItem(session, attachmentUrl) {
     const current = session?.translatedAttachmentItem;
     if (current && typeof current.isAttachment === "function" && current.isAttachment()) {
@@ -1470,6 +1755,11 @@
       throw new Error("Invalid translated PDF source for reader mount");
     }
 
+    if (typeof Zotero?.debug === "function") {
+      Zotero.debug(`[fastRead] loadPdfDataIntoIframe: target=${targetURL}, timeout=${timeoutMs}`);
+    }
+    fastReadLog(`loadPdfDataIntoIframe begin: target=${targetURL}, timeout=${timeoutMs}, token=${loadToken}`);
+
     const isLocalFile = /^file:\/\//i.test(targetURL)
       || /^[A-Za-z]:[\\/]/.test(targetURL)
       || targetURL.startsWith("/");
@@ -1486,6 +1776,7 @@
     }
 
     if (isLocalFile && localFilePath) {
+      fastReadLog(`using local PDF data injection: path=${localFilePath}`);
       if (typeof IOUtils === "undefined" || typeof IOUtils.read !== "function") {
         throw new Error("当前环境不支持 IOUtils.read，无法加载本地译文 PDF");
       }
@@ -1516,7 +1807,7 @@
       session.translatedAttachmentItem = null;
 
       const directViewerURL = "resource://zotero/reader/pdf/web/viewer.html";
-      await loadTranslatedFrameSource(frame, directViewerURL);
+      await loadTranslatedFrameSource(frame, directViewerURL, Math.min(timeoutMs, 12000));
       if (!isSessionAlive(session) || Number(session.translatedLoadToken || 0) !== Number(loadToken)) {
         throw new Error("stale-load-aborted-after-viewer-load");
       }
@@ -1592,6 +1883,7 @@
       if (typeof Zotero?.debug === "function") {
         Zotero.debug("[fastRead] PDF data loaded into viewer successfully");
       }
+      fastReadLog(`PDF data injected successfully: bytes=${uint8Array.byteLength}`);
 
       try {
         const viewerDoc = (iframeWindow.wrappedJSObject || iframeWindow).document;
@@ -1612,6 +1904,7 @@
         if (secondaryToolbar) {
           secondaryToolbar.style.display = "none";
         }
+        enablePDFTextSelection(viewerDoc);
       }
       catch (_error) {
       }
@@ -1625,6 +1918,7 @@
       if (!readerURL) {
         readerURL = targetURL;
       }
+      fastReadLog(`using internal reader route: readerURL=${readerURL}, translatedItem=${!!translatedItem}`);
 
       if (!localFilePath && translatedItem) {
         localFilePath = String(await getAttachmentFilePath(translatedItem) || "").trim();
@@ -1647,12 +1941,15 @@
       }
       session.translatedInternalReader = null;
 
-      await loadTranslatedFrameSource(frame, INTERNAL_READER_FRAME_URL);
+      await loadTranslatedFrameSource(frame, INTERNAL_READER_FRAME_URL, Math.min(timeoutMs, 12000));
       if (!isSessionAlive(session) || Number(session.translatedLoadToken || 0) !== Number(loadToken)) {
         throw new Error("stale-load-aborted-before-create-reader");
       }
 
       const iframeWindow = await waitForTranslatedCreateReader(frame, timeoutMs, intervalMs);
+      if (typeof Zotero?.debug === "function") {
+        Zotero.debug("[fastRead] translated internal reader frame created");
+      }
       if (!isSessionAlive(session) || Number(session.translatedLoadToken || 0) !== Number(loadToken)) {
         throw new Error("stale-load-aborted-before-create-reader-call");
       }
@@ -1682,6 +1979,7 @@
       }
 
       hideTranslatedReaderUI(internalReader);
+      enablePDFTextSelection(internalReader?._primaryView?._iframeWindow || iframeWindow);
     }
   }
 
@@ -1782,6 +2080,121 @@
       headers["X-API-Key"] = config.apiKey;
     }
     return headers;
+  }
+
+  async function fetchWithTimeout(url, options = {}, timeoutMs = 2500) {
+    const requestOptions = { ...(options || {}) };
+    const normalizedTimeout = Math.max(500, Number(timeoutMs) || 2500);
+    if (typeof AbortController !== "function") {
+      return fetch(url, requestOptions);
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), normalizedTimeout);
+    try {
+      return await fetch(url, {
+        ...requestOptions,
+        signal: requestOptions.signal || controller.signal
+      });
+    }
+    finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function stopLocalBackendFromReader() {
+    const bridgeName = "ZoteroFastReadStopLocalBackend";
+    const candidates = [];
+    try {
+      candidates.push(globalThis, globalThis?.wrappedJSObject);
+    }
+    catch (_error) {
+    }
+    try {
+      const mainWin = Zotero.getMainWindow?.() || null;
+      candidates.push(mainWin, mainWin?.wrappedJSObject);
+    }
+    catch (_error) {
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const stopBridge = candidate?.[bridgeName];
+        if (typeof stopBridge === "function") {
+          await stopBridge();
+          return true;
+        }
+      }
+      catch (error) {
+        fastReadLog(`stop backend bridge failed: ${getSafeErrorText(error)}`, "warn");
+      }
+    }
+
+    let requested = false;
+    for (const candidate of LOCAL_REMOTE_BASE_URL_CANDIDATES) {
+      const base = trimTrailingSlash(candidate);
+      if (!base) {
+        continue;
+      }
+      try {
+        await fetchWithTimeout(`${base}/shutdown`, { method: "POST", cache: "no-store" }, 1200);
+        requested = true;
+      }
+      catch (_error) {
+      }
+    }
+    return requested;
+  }
+
+  async function cancelActiveTranslation(session, options = {}) {
+    if (!session || session._translationCancelRequested) {
+      return false;
+    }
+
+    const taskID = String(session.remoteTaskID || "").trim();
+    const active = !!taskID || !!session.remoteTaskPolling;
+    if (!active) {
+      return false;
+    }
+
+    session._translationCancelRequested = true;
+    session.remoteTaskPolling = false;
+    try {
+      setStatus(session, "翻译服务已取消", "info");
+      setTranslationProgress(session, session.translationProgress || 0, "翻译服务已取消", false);
+    }
+    catch (_error) {
+    }
+    if (options.notify) {
+      showReaderAlert("翻译服务已取消");
+    }
+
+    const config = session.remoteTaskConfig || getRemoteTaskConfig();
+    let taskCancelled = false;
+    if (taskID) {
+      const detailURL = buildRemoteTaskDetailURL(config, taskID);
+      if (detailURL) {
+        try {
+          const response = await fetchWithTimeout(detailURL, {
+            method: "DELETE",
+            headers: buildRemoteHeaders(config),
+            credentials: "include"
+          }, 2500);
+          taskCancelled = response.ok;
+        }
+        catch (error) {
+          fastReadLog(`cancel task ${taskID} failed: ${getSafeErrorText(error)}`, "warn");
+        }
+      }
+    }
+
+    if (options.forceBackend || !taskCancelled) {
+      await stopLocalBackendFromReader();
+    }
+
+    session.remoteTaskID = null;
+    session.remoteTaskConfig = null;
+    return true;
   }
 
   function isReachableTaskAPIResponse(response) {
@@ -1992,15 +2405,44 @@
   }
 
   function getAttachmentItemForSession(session) {
-    const direct = session?.reader?._item || null;
-    if (direct && typeof direct.isAttachment === "function" && direct.isAttachment()) {
-      return direct;
+    const reader = session?.reader || null;
+
+    const getAttachmentByID = (itemID) => {
+      const normalizedID = Number(itemID || 0);
+      if (!Number.isFinite(normalizedID) || normalizedID <= 0 || !Zotero?.Items?.get) {
+        return null;
+      }
+      const item = Zotero.Items.get(normalizedID);
+      if (item && typeof item.isAttachment === "function" && item.isAttachment()) {
+        return item;
+      }
+      return null;
+    };
+
+    const directCandidates = [
+      reader?._fastReadLaunchAttachment,
+      reader?._attachmentItem,
+      reader?.attachmentItem,
+      reader?.item,
+      reader?._item
+    ];
+    for (const direct of directCandidates) {
+      if (direct && typeof direct.isAttachment === "function" && direct.isAttachment()) {
+        return direct;
+      }
     }
 
-    const fallbackID = session?.reader?._itemID || session?.reader?.itemID || null;
-    if (fallbackID && Zotero?.Items?.get) {
-      const item = Zotero.Items.get(fallbackID);
-      if (item && typeof item.isAttachment === "function" && item.isAttachment()) {
+    const idCandidates = [
+      reader?._fastReadLaunchItemID,
+      reader?._itemID,
+      reader?.itemID,
+      reader?._state?.itemID,
+      reader?._state?.attachmentID,
+      reader?._state?.primaryViewState?.itemID
+    ];
+    for (const fallbackID of idCandidates) {
+      const item = getAttachmentByID(fallbackID);
+      if (item) {
         return item;
       }
     }
@@ -2084,14 +2526,6 @@
     }
 
     try {
-      if (typeof IOUtils !== "undefined" && typeof IOUtils.exists === "function") {
-        return !!(await IOUtils.exists(target));
-      }
-    }
-    catch (_error) {
-    }
-
-    try {
       if (Zotero?.File?.pathToFile) {
         const nsFile = Zotero.File.pathToFile(target);
         return !!nsFile?.exists?.();
@@ -2100,32 +2534,78 @@
     catch (_error) {
     }
 
+    try {
+      if (typeof IOUtils !== "undefined" && typeof IOUtils.exists === "function") {
+        return !!(await IOUtils.exists(target));
+      }
+    }
+    catch (_error) {
+    }
+
     return false;
   }
 
-  function getTranslatedPdfPathCandidates(sourceDir) {
+  async function promiseWithTimeout(promise, timeoutMs, fallbackValue) {
+    let timer = 0;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(fallbackValue), Math.max(250, Number(timeoutMs) || 1000));
+        })
+      ]);
+    }
+    finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  function getTranslatedPdfPathCandidates(sourceDir, sourcePath = "") {
     const base = String(sourceDir || "").trim();
     if (!base) {
       return [];
     }
 
-    const candidates = [
+    const fileNames = [
       TRANSLATED_PDF_FILE_NAME,
       ...LEGACY_TRANSLATED_PDF_FILE_NAMES
-    ]
+    ];
+
+    const sourceFileName = basenameFromPath(sourcePath);
+    if (sourceFileName && sourceFileName !== "document.pdf") {
+      fileNames.push(`[fastRead 译文] ${sourceFileName}`);
+    }
+
+    const candidates = fileNames
       .map((fileName) => joinFilePath(base, fileName))
       .filter(Boolean);
 
     return Array.from(new Set(candidates));
   }
 
-  async function findExistingTranslatedPdfPath(sourceDir) {
-    const candidates = getTranslatedPdfPathCandidates(sourceDir);
+  async function findExistingTranslatedPdfPath(sourceDir, sourcePath = "") {
+    const candidates = getTranslatedPdfPathCandidates(sourceDir, sourcePath);
+    if (typeof Zotero?.debug === "function") {
+      Zotero.debug(`[fastRead] translated PDF candidates: ${candidates.join(" | ")}`);
+    }
+    fastReadLog(`checking existing translated PDF candidates: count=${candidates.length}, sourceDir=${sourceDir}`);
     for (const candidate of candidates) {
-      if (await fileExists(candidate)) {
+      fastReadLog(`checking translated PDF candidate: ${candidate}`);
+      const exists = await promiseWithTimeout(fileExists(candidate), 1200, false);
+      if (exists) {
+        if (typeof Zotero?.debug === "function") {
+          Zotero.debug(`[fastRead] found translated PDF: ${candidate}`);
+        }
+        fastReadLog(`found existing translated PDF: ${candidate}`);
         return candidate;
       }
     }
+    if (typeof Zotero?.debug === "function") {
+      Zotero.debug("[fastRead] no existing translated PDF found in source directory.");
+    }
+    fastReadLog("no existing translated PDF found beside source PDF");
     return "";
   }
 
@@ -2143,6 +2623,13 @@
     }
 
     return "";
+  }
+
+  async function getSourcePDFPathForSession(session) {
+    const attachment = getAttachmentItemForSession(session);
+    const attachmentPath = await getAttachmentFilePath(attachment);
+    fastReadLog(`resolved source PDF path: attachmentID=${attachment?.id || attachment?.itemID || ""}, hasPath=${!!attachmentPath}, path=${attachmentPath || "(empty)"}`);
+    return String(attachmentPath || "").trim();
   }
 
   function getParentItemIDForAttachment(attachment) {
@@ -2250,12 +2737,7 @@
   }
 
   async function downloadAndImportPDF(session, monoOutputUrl) {
-    const sourceAttachment = getAttachmentItemForSession(session);
-    if (!sourceAttachment) {
-      throw new Error("未找到当前原文附件，无法保存译文。\n请先在左侧打开一个本地 PDF 附件。");
-    }
-
-    const sourcePath = await getAttachmentFilePath(sourceAttachment);
+    const sourcePath = await getSourcePDFPathForSession(session);
     if (!sourcePath) {
       throw new Error("无法获取原文 PDF 路径。");
     }
@@ -2265,6 +2747,7 @@
     }
 
     setStatus(session, "正在从本地服务拉取译文...", "info");
+    setTranslationProgress(session, 92, "正在下载译文", true);
     const response = await fetch(monoOutputUrl, {
       method: "GET",
       credentials: "include"
@@ -2283,6 +2766,7 @@
     const translatedFilePath = joinFilePath(sourceDir, translatedFileName);
 
     setStatus(session, "正在保存译文到原文目录...", "info");
+    setTranslationProgress(session, 96, "正在保存译文", true);
     await writeBinaryFile(translatedFilePath, bytes);
 
     return {
@@ -2328,6 +2812,11 @@
     return Number.isFinite(value) ? value : 0;
   }
 
+  function extractTaskStage(payload) {
+    const task = extractTaskPayload(payload) || payload || {};
+    return String(task?.stage || task?.stageLabel || task?.message || "").trim();
+  }
+
   function extractTaskError(payload) {
     const task = extractTaskPayload(payload) || payload || {};
     const err = task?.error || task?.message || payload?.message || "";
@@ -2335,23 +2824,22 @@
   }
 
   async function requestTranslatedPDFViaAPI(session) {
+    session._translationCancelRequested = false;
     try {
-      const sourceAttachment = getAttachmentItemForSession(session);
-      if (sourceAttachment) {
-        const sourcePath = await getAttachmentFilePath(sourceAttachment);
-        if (sourcePath) {
-          const sourceDir = getParentDirectory(sourcePath);
-          if (sourceDir) {
-            const translatedPath = await findExistingTranslatedPdfPath(sourceDir);
-            if (translatedPath) {
-              const fileURI = toFileURI(translatedPath);
-              if (fileURI) {
-                setStatus(session, "检测到本地译文，跳过翻译...", "info");
-                session.translatedAttachmentItem = null;
-                session.translatedAttachmentPath = translatedPath;
-                await loadTranslatedPDF(session, fileURI);
-                return;
-              }
+      const sourcePath = await getSourcePDFPathForSession(session);
+      if (sourcePath) {
+        const sourceDir = getParentDirectory(sourcePath);
+        if (sourceDir) {
+          const translatedPath = await findExistingTranslatedPdfPath(sourceDir, sourcePath);
+          if (translatedPath) {
+            const fileURI = toFileURI(translatedPath);
+            if (fileURI) {
+              setStatus(session, "检测到本地译文，跳过翻译...", "info");
+              setTranslationProgress(session, 100, "检测到本地译文", true);
+              session.translatedAttachmentItem = null;
+              session.translatedAttachmentPath = translatedPath;
+              await loadTranslatedPDF(session, fileURI);
+              return;
             }
           }
         }
@@ -2366,6 +2854,7 @@
       throw new Error("未配置任务 API Base URL，且未在本机发现可用服务。请在 Windows 侧访问本地服务端口（建议 0.0.0.0:8000 / :18000 / :28000），或在首选项手动填写 Base URL。");
     }
     config.baseURL = resolvedBaseURL;
+    session.remoteTaskConfig = { ...config };
 
     const createURL = buildRemoteCreateTaskURL(config);
     if (!createURL) {
@@ -2376,11 +2865,14 @@
     if (session?.statusNode) {
       setStatus(session, `已选择任务服务端口 ${selectedPort}，准备提交任务...`, "info");
     }
+    setTranslationProgress(session, 3, "准备提交任务", true);
     debugRemoteEndpoint(session, "任务提交", createURL);
 
     setStatus(session, "正在读取本地 PDF，并提交翻译任务...", "info");
+    setTranslationProgress(session, 6, "正在读取 PDF", true);
 
     const file = await readAttachmentPDFBinary(session);
+    setTranslationProgress(session, 10, "正在创建翻译任务", true);
     const multipartFields = {
       documentName: file.fileName,
       taskType: "translation",
@@ -2441,11 +2933,18 @@
       }
 
       session.remoteTaskID = taskID;
-      setStatus(session, `任务已创建 (#${taskID})，正在等待译文 PDF...`, "info");
+      session.remoteTaskConfig = { ...config };
+      const initialStage = extractTaskStage(createPayload) || `任务已创建 (#${taskID})，正在等待译文 PDF`;
+      const initialProgress = Math.max(0, Math.min(100, Math.round(extractTaskProgress(createPayload))));
+      setStatus(session, `${initialStage} (${initialProgress}%)`, "info");
+      setTranslationProgress(session, Math.max(10, initialProgress), initialStage, true);
 
       const startedAt = Date.now();
       let detailEndpointLogged = false;
       while (Date.now() - startedAt < config.pollTimeoutMs) {
+        if (session._translationCancelRequested || session.destroyed) {
+          return;
+        }
         const detailURL = `${buildRemoteTaskDetailURL(config, taskID)}?_ts=${Date.now()}`;
         if (!detailEndpointLogged) {
           debugRemoteEndpoint(session, "任务状态查询", detailURL);
@@ -2475,19 +2974,28 @@
           }
 
           setStatus(session, "译文已保存到原文目录，正在加载本地译文...", "info");
+          setTranslationProgress(session, 98, "正在加载译文", true);
           await loadTranslatedPDF(session, trustedLocalURL);
+          session.remoteTaskID = null;
+          session.remoteTaskConfig = null;
           return;
         }
 
         const status = extractTaskStatus(detailPayload);
         const progress = extractTaskProgress(detailPayload);
+        const stage = extractTaskStage(detailPayload);
         if (["failed", "error", "cancelled", "canceled"].includes(status)) {
           const message = extractTaskError(detailPayload) || `状态: ${status}`;
           throw new Error(`远程翻译任务失败: ${message}`);
         }
 
-        setStatus(session, `任务 #${taskID} 状态: ${status || "running"} (${Math.max(0, Math.min(100, Math.round(progress)))}%)`, "info");
+        const pct = Math.max(0, Math.min(100, Math.round(progress)));
+        setStatus(session, `${stage || `任务 #${taskID} 状态: ${status || "running"}`} (${pct}%)`, "info");
+        setTranslationProgress(session, Math.max(10, Math.min(91, pct)), stage || "正在翻译", true);
         await delay(config.pollIntervalMs);
+        if (session._translationCancelRequested || session.destroyed) {
+          return;
+        }
       }
 
       throw new Error("等待翻译输出 URL 超时。请检查任务中心是否仍在运行。");
@@ -2513,24 +3021,51 @@
     setPlaceholderState(session, "loading");
     session.translatedFrame.classList.remove("is-ready");
     setStatus(session, "正在加载译文 PDF...", "info");
+    setTranslationProgress(session, Math.max(1, session.translationProgress || 0), "正在加载译文 PDF", true);
 
     if (typeof Zotero?.debug === "function") {
       Zotero.debug(`[fastRead] translated URL requested: ${url}; loading by raw data injection`);
+      Zotero.debug(`[fastRead] loadTranslatedPDF: token=${loadToken}, existingFrame=${!!session.translatedFrame}`);
     }
+    fastReadLog(`loadTranslatedPDF start: token=${loadToken}, url=${url}, frameConnected=${session.translatedFrame?.isConnected !== false}`);
 
     let loadError = null;
-    try {
-      await loadPdfDataIntoIframe(session, url, loadToken, 15000, 100);
+    const isLocalTranslatedSource = /^file:\/\//i.test(url)
+      || /^[A-Za-z]:[\\/]/.test(url)
+      || url.startsWith("/");
+    const loadTimeouts = isLocalTranslatedSource
+      ? [15000, 15000, 15000]
+      : [15000, 15000];
+    for (let attempt = 0; attempt < loadTimeouts.length; attempt += 1) {
+      try {
+        fastReadLog(`translated PDF load attempt ${attempt + 1}/${loadTimeouts.length}: timeout=${loadTimeouts[attempt]}, local=${isLocalTranslatedSource}`);
+        if (attempt > 0) {
+          setStatus(session, `译文阅读器首次初始化未完成，正在快速重试（${attempt + 1}/${loadTimeouts.length}）...`, "info");
+          setTranslationProgress(session, Math.max(1, session.translationProgress || 0), "正在重试加载译文", true);
+          if (isLocalTranslatedSource) {
+            resetTranslatedFrame(session);
+          }
+          await delay(700 + attempt * 300);
+        }
 
-      if (!isSessionAlive(session)) {
-        throw new Error("Reader session disposed while loading translated PDF");
+        await loadPdfDataIntoIframe(session, url, loadToken, loadTimeouts[attempt], 100);
+
+        if (!isSessionAlive(session)) {
+          throw new Error("Reader session disposed while loading translated PDF");
+        }
+        loadError = null;
+        break;
       }
-    }
-    catch (primaryError) {
-      if (String(primaryError?.message || "").startsWith("stale-load-aborted")) {
-        return;
+      catch (primaryError) {
+        if (String(primaryError?.message || "").startsWith("stale-load-aborted")) {
+          return;
+        }
+        loadError = primaryError;
+        if (typeof Zotero?.debug === "function") {
+          Zotero.debug(`[fastRead] translated PDF load attempt ${attempt + 1} failed: ${getSafeErrorText(primaryError)}`);
+        }
+        fastReadLog(`translated PDF load attempt ${attempt + 1} failed: ${getSafeErrorText(primaryError)}`, "warn");
       }
-      loadError = primaryError;
     }
 
     if (loadError) {
@@ -2539,6 +3074,7 @@
         ? `HEAD failed: ${urlProbe.error}`
         : `HEAD ${urlProbe.status} ${urlProbe.statusText}; content-type=${urlProbe.contentType || "<none>"}; content-disposition=${urlProbe.contentDisposition || "<none>"}`;
       Zotero.logError(`[fastRead] translated PDF load failed: ${url}; reason: ${loadError.message}; probe: ${probeText}`);
+      fastReadLog(`translated PDF load failed after retries: reason=${getSafeErrorText(loadError)}, probe=${probeText}`, "error");
 
       const isHTTPProbe = /^https?:\/\//i.test(String(url || "").trim());
       const headUnsupported = urlProbe.status === 405 || urlProbe.status === 501;
@@ -2578,17 +3114,75 @@
 
     session.translatedFrame.classList.add("is-ready");
     setPlaceholderState(session, "ready");
+    setTranslationProgress(session, 100, "译文已加载", false);
     session.translatedLoadRetryCount = 0;
+    fastReadLog(`translated PDF load completed: token=${loadToken}, url=${url}`);
 
-    const syncReady = setupSync(session);
+    let syncReady = false;
+    try {
+      syncReady = setupSync(session);
+    }
+    catch (error) {
+      syncReady = false;
+      Zotero.logError(`[fastRead] setupSync after translated load failed: ${getSafeErrorText(error)}`);
+      if (typeof Zotero?.debug === "function") {
+        Zotero.debug(`[fastRead] setupSync after load failed but translated PDF remains visible: ${getSafeErrorText(error)}`);
+      }
+      fastReadLog(`setupSync failed after translated load; right PDF kept visible: ${getSafeErrorText(error)}`, "warn");
+    }
     if (syncReady) {
       setStatus(session, "译文 PDF 已加载，双向同步已开启。", "success");
       updateSyncBadge(session, `Sync: ${getSyncMode()}`);
     }
     else {
       setStatus(session, "译文 PDF 已加载。当前页面跨域，仅支持原文->译文单向同步。", "info");
+      scheduleSyncRetry(session);
       updateSyncBadge(session, "Sync: limited");
     }
+  }
+
+  function scheduleSyncRetry(session, delayMs = 450, attempt = 1) {
+    if (!isSessionAlive(session) || attempt > 10) {
+      return;
+    }
+
+    if (session.syncRetryTimer) {
+      try {
+        const clearTimer = typeof session._syncRetryWindow?.clearTimeout === "function"
+          ? session._syncRetryWindow.clearTimeout.bind(session._syncRetryWindow)
+          : clearTimeout;
+        clearTimer(session.syncRetryTimer);
+      }
+      catch (_error) {
+      }
+      session.syncRetryTimer = 0;
+    }
+
+    const scopeWin = session.doc?.defaultView || globalThis;
+    session._syncRetryWindow = scopeWin;
+    const setTimer = typeof scopeWin?.setTimeout === "function"
+      ? scopeWin.setTimeout.bind(scopeWin)
+      : setTimeout;
+
+    session.syncRetryTimer = setTimer(() => {
+      session.syncRetryTimer = 0;
+      if (!isSessionAlive(session)) {
+        return;
+      }
+      let ready = false;
+      try {
+        ready = setupSync(session);
+      }
+      catch (error) {
+        ready = false;
+        Zotero.logError(`[fastRead] scheduled setupSync retry failed: ${getSafeErrorText(error)}`);
+      }
+      if (ready) {
+        updateSyncBadge(session, `Sync: ${getSyncMode()}`);
+        return;
+      }
+      scheduleSyncRetry(session, Math.min(delayMs + 350, 2500), attempt + 1);
+    }, delayMs);
   }
 
   function getScrollableRoot(doc, fallbackElement) {
@@ -2597,11 +3191,21 @@
         return fallbackElement || null;
       }
 
+      const app = getPDFAppFromDoc(doc);
+      const appContainer = app?.pdfViewer?.container || app?.appConfig?.mainContainer || null;
+      if (appContainer) {
+        return appContainer;
+      }
+
       const viewerContainer = doc.getElementById("viewerContainer")
         || doc.querySelector(".pdfViewerContainer")
         || doc.querySelector(".viewerContainer");
       if (viewerContainer) {
         return viewerContainer;
+      }
+
+      if (fallbackElement && isUsefulScrollRoot(fallbackElement)) {
+        return fallbackElement;
       }
 
       return doc.scrollingElement || doc.documentElement || doc.body || fallbackElement || null;
@@ -2622,6 +3226,15 @@
     }
 
     try {
+      const readerDoc = session?.translatedReaderWindow?.document || null;
+      if (readerDoc) {
+        return readerDoc;
+      }
+    }
+    catch (_error) {
+    }
+
+    try {
       const frameWindow = session?.translatedFrame?.contentWindow;
       const wrappedDoc = (frameWindow?.wrappedJSObject || frameWindow)?.document;
       if (wrappedDoc) {
@@ -2632,6 +3245,128 @@
     catch (_error) {
       return null;
     }
+  }
+
+  function hasPDFPages(doc) {
+    try {
+      return !!doc?.querySelector?.(".page[data-page-number], .page[id^='pageContainer'], #viewer .page, .pdfViewer .page");
+    }
+    catch (_error) {
+      return false;
+    }
+  }
+
+  function isUsefulScrollRoot(root) {
+    if (!root) {
+      return false;
+    }
+    try {
+      return (Number(root.scrollHeight || 0) - Number(root.clientHeight || 0) > 2)
+        || (Number(root.scrollWidth || 0) - Number(root.clientWidth || 0) > 2);
+    }
+    catch (_error) {
+      return false;
+    }
+  }
+
+  function resolvePDFSurface(doc, fallbackElement = null) {
+    if (typeof Zotero?.debug === "function") {
+      Zotero.debug("[fastRead] resolvePDFSurface: probing PDF surface");
+    }
+    const candidates = [];
+    const pushDoc = (candidateDoc) => {
+      try {
+        if (!candidateDoc || candidates.some((entry) => entry.doc === candidateDoc)) {
+          return;
+        }
+        candidates.push({ doc: candidateDoc });
+      }
+      catch (error) {
+        if (typeof Zotero?.debug === "function") {
+          Zotero.debug(`[fastRead] resolvePDFSurface: skipped stale candidate (${getSafeErrorText(error)})`);
+        }
+      }
+    };
+
+    pushDoc(doc);
+    pushDoc(getDocumentFromFrameLike(fallbackElement));
+
+    try {
+      const frames = Array.from(doc?.querySelectorAll?.("iframe, browser") || []);
+      for (const frame of frames) {
+        pushDoc(getDocumentFromFrameLike(frame));
+      }
+    }
+    catch (_error) {
+    }
+
+    let fallback = null;
+    for (const candidate of candidates) {
+      try {
+        const candidateDoc = candidate.doc;
+        const app = getPDFAppFromDoc(candidateDoc);
+        const appRoot = app?.pdfViewer?.container || app?.appConfig?.mainContainer || null;
+        const directRoot = appRoot || getScrollableRoot(candidateDoc, null);
+        const candidateRoot = directRoot || candidateDoc?.scrollingElement || candidateDoc?.documentElement || candidateDoc?.body || null;
+        if (!candidateRoot) {
+          continue;
+        }
+
+        const surface = {
+          doc: candidateDoc,
+          root: candidateRoot,
+          app
+        };
+        if (!fallback) {
+          fallback = surface;
+        }
+        const rootClassName = String(candidateRoot.className || "");
+        const looksLikePDFRoot = candidateRoot.id === "viewerContainer"
+          || rootClassName.includes("pdfViewerContainer")
+          || rootClassName.includes("viewerContainer")
+          || !!candidateDoc?.getElementById?.("viewer")
+          || !!candidateDoc?.querySelector?.(".pdfViewer");
+        if (app?.pdfViewer || hasPDFPages(candidateDoc) || looksLikePDFRoot) {
+          if (typeof Zotero?.debug === "function") {
+            Zotero.debug(`[fastRead] resolvePDFSurface: selected root=${candidateRoot.id || candidateRoot.className || candidateRoot.tagName}`);
+          }
+          return surface;
+        }
+      }
+      catch (error) {
+        if (typeof Zotero?.debug === "function") {
+          Zotero.debug(`[fastRead] resolvePDFSurface: candidate failed (${getSafeErrorText(error)})`);
+        }
+      }
+    }
+
+    let fallbackRoot = null;
+    try {
+      fallbackRoot = fallbackElement && isUsefulScrollRoot(fallbackElement)
+        ? fallbackElement
+        : null;
+    }
+    catch (error) {
+      if (typeof Zotero?.debug === "function") {
+        Zotero.debug(`[fastRead] resolvePDFSurface: fallback element failed (${getSafeErrorText(error)})`);
+      }
+    }
+    if (fallbackRoot) {
+      try {
+        return {
+          doc: fallbackRoot.ownerDocument || doc,
+          root: fallbackRoot,
+          app: getPDFAppFromDoc(fallbackRoot.ownerDocument || doc)
+        };
+      }
+      catch (error) {
+        if (typeof Zotero?.debug === "function") {
+          Zotero.debug(`[fastRead] resolvePDFSurface: fallback root failed (${getSafeErrorText(error)})`);
+        }
+      }
+    }
+
+    return fallback;
   }
 
   function getScrollRatio(scrollRoot) {
@@ -2645,19 +3380,54 @@
     return scrollRoot.scrollTop / max;
   }
 
+  function getHorizontalScrollRatio(scrollRoot) {
+    if (!scrollRoot) {
+      return 0;
+    }
+    const max = Math.max(0, scrollRoot.scrollWidth - scrollRoot.clientWidth);
+    if (!max) {
+      return 0;
+    }
+    return scrollRoot.scrollLeft / max;
+  }
+
   function applyScrollRatio(scrollRoot, ratio) {
     if (!scrollRoot) {
       return;
     }
     const max = Math.max(0, scrollRoot.scrollHeight - scrollRoot.clientHeight);
-    scrollRoot.scrollTop = Math.max(0, Math.min(max, ratio * max));
+    const nextTop = Math.max(0, Math.min(max, ratio * max));
+    if (Math.abs(Number(scrollRoot.scrollTop || 0) - nextTop) > 0.5) {
+      scrollRoot.scrollTop = nextTop;
+    }
+  }
+
+  function applyHorizontalScrollRatio(scrollRoot, ratio) {
+    if (!scrollRoot) {
+      return;
+    }
+    const max = Math.max(0, scrollRoot.scrollWidth - scrollRoot.clientWidth);
+    const nextLeft = Math.max(0, Math.min(max, Number(ratio || 0) * max));
+    if (Math.abs(Number(scrollRoot.scrollLeft || 0) - nextLeft) > 1.5) {
+      scrollRoot.scrollLeft = nextLeft;
+    }
+  }
+
+  function getPDFAppFromDoc(doc) {
+    try {
+      const view = doc?.defaultView;
+      return view?.wrappedJSObject?.PDFViewerApplication
+        || view?.PDFViewerApplication
+        || null;
+    }
+    catch (_error) {
+      return null;
+    }
   }
 
   function getCurrentPageNumberFromDoc(doc) {
     try {
-      const view = doc?.defaultView;
-      const app = view?.wrappedJSObject?.PDFViewerApplication
-        || view?.PDFViewerApplication;
+      const app = getPDFAppFromDoc(doc);
       const number = Number(app?.pdfViewer?.currentPageNumber || app?.page || 0);
       if (Number.isFinite(number) && number > 0) {
         return number;
@@ -2669,7 +3439,8 @@
   }
 
   function setCurrentPageNumberInDoc(doc, pageNumber) {
-    if (!doc || !pageNumber) {
+    const normalized = Number(pageNumber);
+    if (!doc || !Number.isFinite(normalized) || normalized <= 0) {
       return false;
     }
     try {
@@ -2680,15 +3451,226 @@
       if (!viewer) {
         return false;
       }
-      if (typeof viewer.scrollPageIntoView === "function") {
-        viewer.scrollPageIntoView({ pageNumber });
-      }
-      viewer.currentPageNumber = pageNumber;
+      viewer.currentPageNumber = normalized;
       return true;
     }
     catch (_error) {
       return false;
     }
+  }
+
+  function getAppScaleValue(app) {
+    try {
+      const value = app?.pdfViewer?.currentScaleValue || app?.pdfViewer?.currentScale || "";
+      return value === "auto" || value === "page-width" || value === "page-fit" || value === "page-actual"
+        ? value
+        : Number(value) || value || "";
+    }
+    catch (_error) {
+      return "";
+    }
+  }
+
+  function clampRatio(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+      return 0;
+    }
+    return Math.max(0, Math.min(1, number));
+  }
+
+  function getScrollViewportRect(doc, scrollRoot) {
+    try {
+      if (!scrollRoot) {
+        const view = doc?.defaultView || null;
+        return {
+          top: 0,
+          left: 0,
+          right: Number(view?.innerWidth || 0),
+          bottom: Number(view?.innerHeight || 0),
+          width: Number(view?.innerWidth || 0),
+          height: Number(view?.innerHeight || 0)
+        };
+      }
+
+      if (
+        scrollRoot === doc?.scrollingElement
+        || scrollRoot === doc?.documentElement
+        || scrollRoot === doc?.body
+      ) {
+        const view = doc?.defaultView || null;
+        const width = Number(view?.innerWidth || scrollRoot.clientWidth || 0);
+        const height = Number(view?.innerHeight || scrollRoot.clientHeight || 0);
+        return {
+          top: 0,
+          left: 0,
+          right: width,
+          bottom: height,
+          width,
+          height
+        };
+      }
+
+      return scrollRoot.getBoundingClientRect();
+    }
+    catch (_error) {
+      return null;
+    }
+  }
+
+  function getPDFPageElements(doc) {
+    try {
+      return Array.from(doc?.querySelectorAll?.(".page[data-page-number], .page[id^='pageContainer']") || []);
+    }
+    catch (_error) {
+      return [];
+    }
+  }
+
+  function getPageNumberFromElement(pageElement) {
+    const raw = pageElement?.getAttribute?.("data-page-number")
+      || String(pageElement?.id || "").replace(/^pageContainer/, "");
+    const pageNumber = Number(raw);
+    return Number.isFinite(pageNumber) && pageNumber > 0 ? pageNumber : 0;
+  }
+
+  function getPDFPageElement(doc, pageNumber) {
+    const normalized = Number(pageNumber);
+    if (!Number.isFinite(normalized) || normalized <= 0) {
+      return null;
+    }
+
+    try {
+      const direct = doc?.querySelector?.(`.page[data-page-number="${normalized}"], #pageContainer${normalized}`);
+      if (direct) {
+        return direct;
+      }
+    }
+    catch (_error) {
+    }
+
+    try {
+      const app = getPDFAppFromDoc(doc);
+      const view = app?.pdfViewer?.getPageView?.(normalized - 1);
+      return view?.div || null;
+    }
+    catch (_error) {
+      return null;
+    }
+  }
+
+  function getVisiblePagePosition(doc, scrollRoot) {
+    const root = scrollRoot || getScrollableRoot(doc, null);
+    if (!doc || !root) {
+      return null;
+    }
+
+    const rootRect = getScrollViewportRect(doc, root);
+    if (!rootRect || !rootRect.height || !rootRect.width) {
+      return null;
+    }
+
+    const anchorViewportRatio = 0.18;
+    const anchorY = rootRect.top + Math.max(1, rootRect.height * anchorViewportRatio);
+    let best = null;
+    let bestByArea = null;
+    let nearest = null;
+    for (const pageElement of getPDFPageElements(doc)) {
+      const pageNumber = getPageNumberFromElement(pageElement);
+      if (!pageNumber) {
+        continue;
+      }
+
+      const pageRect = pageElement.getBoundingClientRect();
+      if (!pageRect.width || !pageRect.height) {
+        continue;
+      }
+
+      const distanceToAnchor = anchorY < pageRect.top
+        ? pageRect.top - anchorY
+        : anchorY > pageRect.bottom
+          ? anchorY - pageRect.bottom
+          : 0;
+      const visibleWidth = Math.max(0, Math.min(rootRect.right, pageRect.right) - Math.max(rootRect.left, pageRect.left));
+      const visibleHeight = Math.max(0, Math.min(rootRect.bottom, pageRect.bottom) - Math.max(rootRect.top, pageRect.top));
+      const visibleArea = visibleWidth * visibleHeight;
+      const candidate = {
+        pageNumber,
+        pageRect,
+        visibleArea,
+        distanceToAnchor
+      };
+
+      if (!nearest || distanceToAnchor < nearest.distanceToAnchor) {
+        nearest = candidate;
+      }
+      if (visibleArea && (!bestByArea || visibleArea > bestByArea.visibleArea)) {
+        bestByArea = candidate;
+      }
+      if (distanceToAnchor === 0) {
+        best = candidate;
+        break;
+      }
+    }
+
+    if (!best) {
+      best = bestByArea || nearest;
+    }
+
+    if (!best) {
+      const currentPageNumber = getCurrentPageNumberFromDoc(doc);
+      return currentPageNumber
+        ? {
+            pageNumber: currentPageNumber,
+            topRatio: 0,
+            anchorViewportRatio,
+            horizontalRatio: getHorizontalScrollRatio(root),
+            scaleValue: getAppScaleValue(getPDFAppFromDoc(doc))
+          }
+        : null;
+    }
+
+    return {
+      pageNumber: best.pageNumber,
+      topRatio: clampRatio((anchorY - best.pageRect.top) / best.pageRect.height),
+      anchorViewportRatio,
+      leftRatio: clampRatio((rootRect.left - best.pageRect.left) / best.pageRect.width),
+      horizontalRatio: getHorizontalScrollRatio(root),
+      scaleValue: getAppScaleValue(getPDFAppFromDoc(doc))
+    };
+  }
+
+  function applyVisiblePagePosition(doc, scrollRoot, position) {
+    const pageNumber = Number(position?.pageNumber || 0);
+    if (!doc || !scrollRoot || !Number.isFinite(pageNumber) || pageNumber <= 0) {
+      return false;
+    }
+
+    const pageElement = getPDFPageElement(doc, pageNumber);
+    if (!pageElement) {
+      return setCurrentPageNumberInDoc(doc, pageNumber);
+    }
+
+    const rootRect = getScrollViewportRect(doc, scrollRoot);
+    const pageRect = pageElement.getBoundingClientRect();
+    if (!rootRect || !pageRect.height) {
+      return setCurrentPageNumberInDoc(doc, pageNumber);
+    }
+
+    const maxTop = Math.max(0, scrollRoot.scrollHeight - scrollRoot.clientHeight);
+    const anchorViewportRatio = Number.isFinite(Number(position.anchorViewportRatio))
+      ? clampRatio(position.anchorViewportRatio)
+      : 0.18;
+    const anchorY = rootRect.top + Math.max(1, rootRect.height * anchorViewportRatio);
+    const nextTop = scrollRoot.scrollTop
+      + (pageRect.top - anchorY)
+      + clampRatio(position.topRatio) * pageRect.height;
+    const clampedTop = Math.max(0, Math.min(maxTop, nextTop));
+    if (Math.abs(Number(scrollRoot.scrollTop || 0) - clampedTop) > 0.5) {
+      scrollRoot.scrollTop = clampedTop;
+    }
+
+    return true;
   }
 
   function getSafeErrorText(error, fallback = "unknown-error") {
@@ -2741,17 +3723,39 @@
     return fallback;
   }
 
+  function isDeadObjectError(error) {
+    const text = getSafeErrorText(error, "");
+    return /dead object/i.test(text) || /can't access/i.test(text);
+  }
+
+  function isCancellationLikeError(session, error) {
+    return !!(
+      session?._translationCancelRequested
+      || session?.destroyed
+      || isDeadObjectError(error)
+    );
+  }
+
   function setupSync(session) {
     if (!isSessionAlive(session)) {
       return false;
     }
 
-    const sourcePDFDoc = session.leftPDFDoc || session.doc;
+    detachSync(session);
+    fastReadLog(`setupSync begin: originalHidden=${!!session.originalHidden}, hasTranslatedFrame=${!!session.translatedFrame}`);
+
+    let sourcePDFDoc = session.leftPDFDoc || session.reader?._iframeWindow?.document || session.doc;
     if (!sourcePDFDoc) {
+      fastReadLog("setupSync unavailable: source PDF document missing", "warn");
       return false;
     }
 
-    const rightDoc = getTranslatedViewerDoc(session);
+    let rightDoc = getTranslatedViewerDoc(session);
+    if (!rightDoc) {
+      updateSyncBadge(session, "Sync: waiting");
+      fastReadLog("setupSync waiting: translated viewer document missing", "warn");
+      return false;
+    }
 
     injectViewerChromeStyle(sourcePDFDoc);
     injectViewerChromeStyle(rightDoc);
@@ -2762,32 +3766,81 @@
       return false;
     }
 
-    const leftRoot = getScrollableRoot(sourcePDFDoc, session.leftPane);
+    let leftSurface = null;
+    let rightSurface = null;
+    try {
+      leftSurface = resolvePDFSurface(sourcePDFDoc, session.leftPane);
+    }
+    catch (error) {
+      Zotero.logError(`[fastRead] resolve left PDF surface failed: ${getSafeErrorText(error)}`);
+    }
+    try {
+      rightSurface = resolvePDFSurface(rightDoc, session.translatedFrame);
+    }
+    catch (error) {
+      Zotero.logError(`[fastRead] resolve right PDF surface failed: ${getSafeErrorText(error)}`);
+    }
+    if (leftSurface?.doc) {
+      sourcePDFDoc = leftSurface.doc;
+    }
+    if (rightSurface?.doc) {
+      rightDoc = rightSurface.doc;
+    }
+
+    const leftApp = leftSurface?.app || getPDFAppFromDoc(sourcePDFDoc);
+    const rightApp = rightSurface?.app || getPDFAppFromDoc(rightDoc);
+    const leftRoot = leftSurface?.root || getScrollableRoot(sourcePDFDoc, leftApp?.pdfViewer?.container || session.leftPane);
 
     session.leftScrollRoot = leftRoot;
     let rightViewerContainer = null;
     try {
-      rightViewerContainer = rightDoc?.getElementById?.("viewerContainer") || null;
+      rightViewerContainer = rightApp?.pdfViewer?.container || rightDoc?.getElementById?.("viewerContainer") || null;
     }
     catch (_error) {
     }
     session.translatedViewerContainer = rightViewerContainer;
-    session.translatedScrollRoot = rightViewerContainer || getScrollableRoot(rightDoc, null);
+    session.translatedScrollRoot = rightSurface?.root || rightViewerContainer || getScrollableRoot(rightDoc, null);
 
     if (!leftRoot || !session.translatedScrollRoot) {
+      if (typeof Zotero?.debug === "function") {
+        Zotero.debug(`[fastRead] sync unavailable: leftRoot=${!!leftRoot}, rightRoot=${!!session.translatedScrollRoot}`);
+      }
+      fastReadLog(`sync unavailable: leftRoot=${!!leftRoot}, rightRoot=${!!session.translatedScrollRoot}, leftPages=${getPDFPageElements(sourcePDFDoc).length}, rightPages=${getPDFPageElements(rightDoc).length}`, "warn");
       return false;
     }
+
+    if (typeof Zotero?.debug === "function") {
+      Zotero.debug(`[fastRead] sync attached: left=${leftRoot.id || leftRoot.className || leftRoot.tagName}, right=${session.translatedScrollRoot.id || session.translatedScrollRoot.className || session.translatedScrollRoot.tagName}, leftPages=${getPDFPageElements(sourcePDFDoc).length}, rightPages=${getPDFPageElements(rightDoc).length}`);
+    }
+    fastReadLog(`sync attached: mode=${getSyncMode()}, left=${leftRoot.id || leftRoot.className || leftRoot.tagName}, right=${session.translatedScrollRoot.id || session.translatedScrollRoot.className || session.translatedScrollRoot.tagName}, leftPages=${getPDFPageElements(sourcePDFDoc).length}, rightPages=${getPDFPageElements(rightDoc).length}, leftScroll=${leftRoot.scrollWidth}x${leftRoot.scrollHeight}, rightScroll=${session.translatedScrollRoot.scrollWidth}x${session.translatedScrollRoot.scrollHeight}`);
 
     const syncMode = getSyncMode();
     const syncByRatio = (source, target) => {
       const ratio = getScrollRatio(source);
       applyScrollRatio(target, ratio);
+      applyHorizontalScrollRatio(target, getHorizontalScrollRatio(source));
     };
-    const syncByPage = (sourceDoc, targetDoc, fallbackSource, fallbackTarget) => {
+
+    const syncByPagePosition = (sourceDoc, targetDoc, fallbackSource, fallbackTarget) => {
+      const position = getVisiblePagePosition(sourceDoc, fallbackSource);
+      const success = position
+        ? applyVisiblePagePosition(targetDoc, fallbackTarget, position)
+        : false;
+
+      if (success) {
+        if (Number.isFinite(Number(position?.horizontalRatio))) {
+          applyHorizontalScrollRatio(fallbackTarget, position.horizontalRatio);
+        }
+        return;
+      }
+
       const pageNumber = getCurrentPageNumberFromDoc(sourceDoc);
-      const success = setCurrentPageNumberInDoc(targetDoc, pageNumber);
-      if (!success) {
+      const pageSuccess = setCurrentPageNumberInDoc(targetDoc, pageNumber);
+      if (!pageSuccess) {
         syncByRatio(fallbackSource, fallbackTarget);
+      }
+      else {
+        applyHorizontalScrollRatio(fallbackTarget, getHorizontalScrollRatio(fallbackSource));
       }
     };
 
@@ -2821,7 +3874,24 @@
           session.scrollSyncSource = "";
         }
         session.scrollSyncReleaseTimer = 0;
-      }, 90);
+      }, 450);
+    };
+
+    const rememberCurrentScrollState = () => {
+      try {
+        session._lastLeftScrollTop = Number(leftRoot?.scrollTop || 0);
+        session._lastLeftScrollLeft = Number(leftRoot?.scrollLeft || 0);
+        session._lastRightScrollTop = Number(session.translatedScrollRoot?.scrollTop || 0);
+        session._lastRightScrollLeft = Number(session.translatedScrollRoot?.scrollLeft || 0);
+      }
+      catch (_error) {
+      }
+    };
+
+    const getSideSuppressKey = (side) => side === "left" ? "_leftSuppressUntil" : "_rightSuppressUntil";
+    const isSideSuppressed = (side) => Date.now() < Number(session[getSideSuppressKey(side)] || 0);
+    const suppressSide = (side, durationMs = 650) => {
+      session[getSideSuppressKey(side)] = Date.now() + durationMs;
     };
 
     const runScrollSync = (side, sourceRoot, targetRoot, sourceDoc, targetDoc) => {
@@ -2830,13 +3900,15 @@
       }
 
       scheduleScrollUnlock(side, sourceRoot);
+      suppressSide(side === "left" ? "right" : "left");
 
       if (syncMode === "page") {
-        syncByPage(sourceDoc, targetDoc, sourceRoot, targetRoot);
+        syncByPagePosition(sourceDoc, targetDoc, sourceRoot, targetRoot);
       }
       else {
         syncByRatio(sourceRoot, targetRoot);
       }
+      rememberCurrentScrollState();
     };
 
     const queueScrollSync = (side, root, callback) => {
@@ -2867,15 +3939,24 @@
         detachSync(session);
         return;
       }
+      if (isSideSuppressed("left")) {
+        rememberCurrentScrollState();
+        return;
+      }
       try {
         queueScrollSync("left", leftRoot, () => {
           if (!isSessionAlive(session) || !leftRoot || !session.translatedScrollRoot) {
             return;
           }
+          if (isSideSuppressed("left")) {
+            rememberCurrentScrollState();
+            return;
+          }
           runScrollSync("left", leftRoot, session.translatedScrollRoot, sourcePDFDoc, rightDoc);
         });
       }
-      catch (_error) {
+      catch (error) {
+        fastReadLog(`left scroll sync failed; detaching sync: ${getSafeErrorText(error)}`, "warn");
         detachSync(session);
       }
     };
@@ -2885,15 +3966,24 @@
         detachSync(session);
         return;
       }
+      if (isSideSuppressed("right")) {
+        rememberCurrentScrollState();
+        return;
+      }
       try {
         queueScrollSync("right", session.translatedScrollRoot, () => {
           if (!isSessionAlive(session) || !leftRoot || !session.translatedScrollRoot) {
             return;
           }
+          if (isSideSuppressed("right")) {
+            rememberCurrentScrollState();
+            return;
+          }
           runScrollSync("right", session.translatedScrollRoot, leftRoot, rightDoc, sourcePDFDoc);
         });
       }
-      catch (_error) {
+      catch (error) {
+        fastReadLog(`right scroll sync failed; detaching sync: ${getSafeErrorText(error)}`, "warn");
         detachSync(session);
       }
     };
@@ -2904,19 +3994,67 @@
     session.translatedScrollRoot.addEventListener("scroll", syncFromRight, { passive: true });
     session.rightScrollListener = syncFromRight;
 
-    let leftApp = null;
-    let rightApp = null;
-    try {
-      const leftWin = sourcePDFDoc?.defaultView;
-      leftApp = leftWin?.wrappedJSObject?.PDFViewerApplication || leftWin?.PDFViewerApplication || null;
+    session._lastLeftScrollTop = Number(leftRoot.scrollTop || 0);
+    session._lastLeftScrollLeft = Number(leftRoot.scrollLeft || 0);
+    session._lastRightScrollTop = Number(session.translatedScrollRoot.scrollTop || 0);
+    session._lastRightScrollLeft = Number(session.translatedScrollRoot.scrollLeft || 0);
+
+    const syncPollWindow = getNodeWindow(leftRoot, sourcePDFDoc) || globalThis;
+    session._syncPollWindow = syncPollWindow;
+    const setPollInterval = typeof syncPollWindow?.setInterval === "function"
+      ? syncPollWindow.setInterval.bind(syncPollWindow)
+      : setInterval;
+    session.syncPollInterval = setPollInterval(() => {
+      if (!isSessionAlive(session) || !leftRoot || !session.translatedScrollRoot) {
+        detachSync(session);
+        return;
+      }
+
+      const leftTop = Number(leftRoot.scrollTop || 0);
+      const leftLeft = Number(leftRoot.scrollLeft || 0);
+      const rightTop = Number(session.translatedScrollRoot.scrollTop || 0);
+      const rightLeft = Number(session.translatedScrollRoot.scrollLeft || 0);
+      const leftChanged = Math.abs(leftTop - Number(session._lastLeftScrollTop || 0)) > 0.5
+        || Math.abs(leftLeft - Number(session._lastLeftScrollLeft || 0)) > 0.5;
+      const rightChanged = Math.abs(rightTop - Number(session._lastRightScrollTop || 0)) > 0.5
+        || Math.abs(rightLeft - Number(session._lastRightScrollLeft || 0)) > 0.5;
+
+      session._lastLeftScrollTop = leftTop;
+      session._lastLeftScrollLeft = leftLeft;
+      session._lastRightScrollTop = rightTop;
+      session._lastRightScrollLeft = rightLeft;
+
+      if (session.scrollSyncSource) {
+        return;
+      }
+      if (leftChanged && isSideSuppressed("left")) {
+        return;
+      }
+      if (rightChanged && isSideSuppressed("right")) {
+        return;
+      }
+      if (leftChanged && !rightChanged) {
+        syncFromLeft();
+      }
+      else if (rightChanged && !leftChanged) {
+        syncFromRight();
+      }
+    }, 160);
+
+    const leftViewEventBus = leftApp?.eventBus || leftApp?.pdfViewer?.eventBus || null;
+    const rightViewEventBus = rightApp?.eventBus || rightApp?.pdfViewer?.eventBus || null;
+    if (leftViewEventBus && typeof leftViewEventBus.on === "function") {
+      leftViewEventBus.on("updateviewarea", syncFromLeft);
+      leftViewEventBus.on("pagechanging", syncFromLeft);
+      session._leftViewListener = syncFromLeft;
+      session._leftViewEventBus = leftViewEventBus;
     }
-    catch (_error) {
-    }
-    try {
-      const rightWin = rightDoc?.defaultView;
-      rightApp = rightWin?.wrappedJSObject?.PDFViewerApplication || rightWin?.PDFViewerApplication || null;
-    }
-    catch (_error) {
+
+    if (rightViewEventBus && typeof rightViewEventBus.on === "function") {
+      rightViewEventBus.on("updateviewarea", syncFromRight);
+      rightViewEventBus.on("pagechanging", syncFromRight);
+      session._rightViewListener = syncFromRight;
+      session._rightViewEventBus = rightViewEventBus;
     }
 
     if (leftApp?.pdfViewer && rightApp?.pdfViewer) {
@@ -2989,9 +4127,18 @@
 
         if (typeof scaleValue === "number") {
           targetViewer.currentScale = scaleValue;
-          return;
         }
-        targetViewer.currentScaleValue = scaleValue;
+        else {
+          targetViewer.currentScaleValue = scaleValue;
+        }
+
+        const scopeWin = sourceDoc?.defaultView || globalThis;
+        const setTimer = typeof scopeWin?.setTimeout === "function"
+          ? scopeWin.setTimeout.bind(scopeWin)
+          : setTimeout;
+        const resync = side === "left" ? syncFromLeft : syncFromRight;
+        setTimer(resync, 80);
+        setTimer(resync, 220);
       };
 
       const syncZoomFromLeft = (evt) => {
@@ -3010,8 +4157,8 @@
         }
       };
 
-      const leftEventBus = leftApp.eventBus || leftApp.pdfViewer?.eventBus;
-      const rightEventBus = rightApp.eventBus || rightApp.pdfViewer?.eventBus;
+      const leftEventBus = leftViewEventBus;
+      const rightEventBus = rightViewEventBus;
 
       if (leftEventBus && typeof leftEventBus.on === "function") {
         leftEventBus.on("scalechanging", syncZoomFromLeft);
@@ -3073,6 +4220,24 @@
     }
 
     try {
+      if (session._leftViewEventBus && session._leftViewListener && typeof session._leftViewEventBus.off === "function") {
+        session._leftViewEventBus.off("updateviewarea", session._leftViewListener);
+        session._leftViewEventBus.off("pagechanging", session._leftViewListener);
+      }
+    }
+    catch (_error) {
+    }
+
+    try {
+      if (session._rightViewEventBus && session._rightViewListener && typeof session._rightViewEventBus.off === "function") {
+        session._rightViewEventBus.off("updateviewarea", session._rightViewListener);
+        session._rightViewEventBus.off("pagechanging", session._rightViewListener);
+      }
+    }
+    catch (_error) {
+    }
+
+    try {
       if (session.leftScrollRAF && session.leftScrollRoot?.ownerDocument?.defaultView?.cancelAnimationFrame) {
         session.leftScrollRoot.ownerDocument.defaultView.cancelAnimationFrame(session.leftScrollRAF);
       }
@@ -3094,6 +4259,26 @@
     if (session.scaleSyncReleaseTimer) {
       clearTimeout(session.scaleSyncReleaseTimer);
     }
+    if (session.syncPollInterval) {
+      try {
+        const clearPollInterval = typeof session._syncPollWindow?.clearInterval === "function"
+          ? session._syncPollWindow.clearInterval.bind(session._syncPollWindow)
+          : clearInterval;
+        clearPollInterval(session.syncPollInterval);
+      }
+      catch (_error) {
+      }
+    }
+    if (session.syncRetryTimer) {
+      try {
+        const clearRetryTimer = typeof session._syncRetryWindow?.clearTimeout === "function"
+          ? session._syncRetryWindow.clearTimeout.bind(session._syncRetryWindow)
+          : clearTimeout;
+        clearRetryTimer(session.syncRetryTimer);
+      }
+      catch (_error) {
+      }
+    }
 
     session.leftScrollListener = null;
     session.rightScrollListener = null;
@@ -3101,13 +4286,27 @@
     session._rightZoomListener = null;
     session._leftEventBus = null;
     session._rightEventBus = null;
+    session._leftViewListener = null;
+    session._rightViewListener = null;
+    session._leftViewEventBus = null;
+    session._rightViewEventBus = null;
     session.scrollSyncSource = "";
     session.scaleSyncSource = "";
     session.scrollSyncReleaseTimer = 0;
     session.scaleSyncReleaseTimer = 0;
     session.leftScrollRAF = 0;
     session.rightScrollRAF = 0;
+    session.syncPollInterval = 0;
+    session.syncRetryTimer = 0;
+    session._syncPollWindow = null;
+    session._syncRetryWindow = null;
+    session._lastLeftScrollTop = 0;
+    session._lastLeftScrollLeft = 0;
+    session._lastRightScrollTop = 0;
+    session._lastRightScrollLeft = 0;
     session.suppressSyncUntil = 0;
+    session._leftSuppressUntil = 0;
+    session._rightSuppressUntil = 0;
     session.suppressScaleSyncUntil = 0;
     session.leftScrollRoot = null;
     session.translatedScrollRoot = null;
@@ -3115,22 +4314,15 @@
   }
 
   async function autoLoadTranslatedPDFIfNeeded(session) {
+    fastReadLog("autoLoadTranslatedPDFIfNeeded begin");
     if (session.translatedURLInput) {
       session.translatedURLInput.value = "";
     }
 
-    const sourceAttachment = getAttachmentItemForSession(session);
-    if (!sourceAttachment) {
-      if (isRemoteAutoTranslateEnabled()) {
-        await requestTranslatedPDFViaAPI(session);
-        return;
-      }
-      updateSyncBadge(session, "Sync: idle");
-      return;
-    }
-
-    const sourcePath = await getAttachmentFilePath(sourceAttachment);
+    setTranslationProgress(session, 0, "正在定位原文 PDF", true);
+    const sourcePath = await getSourcePDFPathForSession(session);
     if (!sourcePath) {
+      fastReadLog("autoLoad: source path missing");
       if (isRemoteAutoTranslateEnabled()) {
         await requestTranslatedPDFViaAPI(session);
         return;
@@ -3142,12 +4334,15 @@
     const sourceDir = getParentDirectory(sourcePath);
     if (sourceDir) {
       setStatus(session, "正在检查本地已有译文...", "info");
+      setTranslationProgress(session, 2, "正在检查本地译文", true);
 
-      const translatedPath = await findExistingTranslatedPdfPath(sourceDir);
+      const translatedPath = await findExistingTranslatedPdfPath(sourceDir, sourcePath);
       if (translatedPath) {
         const fileURI = toFileURI(translatedPath);
         if (fileURI) {
+          fastReadLog(`autoLoad: loading existing translated PDF via fileURI=${fileURI}`);
           setStatus(session, "检测到本地译文，正在加载...", "info");
+          setTranslationProgress(session, 100, "检测到本地译文", true);
           writePref(PREF_KEYS.translatedPdfURL, "");
           session.translatedAttachmentItem = null;
           session.translatedAttachmentPath = translatedPath;
@@ -3158,10 +4353,12 @@
     }
 
     if (isRemoteAutoTranslateEnabled()) {
+      fastReadLog("autoLoad: no local translated PDF, submitting remote/local translation task");
       await requestTranslatedPDFViaAPI(session);
       return;
     }
 
+    fastReadLog("autoLoad: no local translated PDF and auto translate disabled");
     updateSyncBadge(session, "Sync: idle");
   }
 
@@ -3192,6 +4389,7 @@
   }
 
   function disableFastReadMode(session) {
+    void cancelActiveTranslation(session, { forceBackend: true, notify: true });
     clearHighlight(session);
     detachSync(session);
     revokeTranslatedBlobURL(session);
@@ -3223,6 +4421,7 @@
     session.translatedAttachmentPath = "";
     session.translatedInternalReader = null;
     session.translatedReaderWindow = null;
+    session.originalHidden = false;
     session.leftPDFDoc = null;
     session.remoteTaskID = null;
     session.remoteTaskPolling = false;
@@ -3232,6 +4431,7 @@
   }
 
   async function initSplitView(session) {
+    fastReadLog("initSplitView begin");
     const layout = await ensureSplitLayoutWithRetry(session);
     if (!layout) {
       throw new Error("未能定位 PDF 阅读区域，请稍后重试。");
@@ -3244,6 +4444,7 @@
     session.statusNode = layout.panel.querySelector(`#${STATUS_ID}`);
     session.bodyNode = layout.panel.querySelector(`#${BODY_ID}`);
     session.fastReadEnabled = true;
+    fastReadLog(`initSplitView layout ready: hasLeftPane=${!!session.leftPane}, hasPanel=${!!session.panel}, hasPDFDoc=${!!session.leftPDFDoc}`);
 
     wirePanel(session);
     setStatus(session, "等待加载译文 PDF...", "info");
@@ -3251,6 +4452,15 @@
       await autoLoadTranslatedPDFIfNeeded(session);
     }
     catch (error) {
+      if (isCancellationLikeError(session, error)) {
+        try {
+          setStatus(session, "翻译服务已取消", "info");
+        }
+        catch (_innerError) {
+        }
+        return;
+      }
+      fastReadLog(`autoLoadTranslatedPDFIfNeeded failed: ${getSafeErrorText(error)}`, "error");
       setStatus(session, `自动加载失败: ${getSafeErrorText(error)}`, "error");
       Zotero.logError(error);
     }
@@ -3264,6 +4474,7 @@
     const shouldEnable = typeof enable === "boolean"
       ? enable
       : !session.fastReadEnabled;
+    fastReadLog(`toggleFastReadMode: shouldEnable=${shouldEnable}, current=${!!session.fastReadEnabled}`);
 
     if (!shouldEnable) {
       disableFastReadMode(session);
@@ -3292,6 +4503,10 @@
     }
 
     toggleFastReadMode(session, enable).catch((error) => {
+      if (isCancellationLikeError(session, error)) {
+        showReaderAlert("翻译服务已取消");
+        return;
+      }
       Zotero.logError(error);
       showReaderAlert(`fastRead 启动失败: ${getSafeErrorText(error)}`);
     });
@@ -3314,6 +4529,10 @@
     }
 
     toggleFastReadMode(session, true).catch((error) => {
+      if (isCancellationLikeError(session, error)) {
+        showReaderAlert("翻译服务已取消");
+        return;
+      }
       Zotero.logError(error);
       showReaderAlert(`fastRead 启动失败: ${getSafeErrorText(error)}`);
     });
@@ -3350,6 +4569,29 @@
     }
   }
 
+  function setTranslationProgress(session, percent, message = "", visible = true) {
+    const placeholder = session?.translatedPlaceholder;
+    if (!placeholder) {
+      return;
+    }
+
+    const progressNode = placeholder.querySelector(".zdr-single-progress");
+    const labelNode = placeholder.querySelector(".zdr-single-progress-label");
+    const barNode = placeholder.querySelector(".zdr-single-progress-bar");
+    if (!progressNode || !barNode) {
+      return;
+    }
+
+    const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+    session.translationProgress = clamped;
+    progressNode.style.display = visible ? "grid" : "none";
+    barNode.style.width = `${clamped}%`;
+    if (labelNode) {
+      const text = String(message || "处理中").trim();
+      labelNode.textContent = `${text} ${Math.round(clamped)}%`;
+    }
+  }
+
   function setPlaceholderState(session, state) {
     const placeholder = session?.translatedPlaceholder;
     if (!placeholder) {
@@ -3361,6 +4603,7 @@
     placeholder.style.display = state === "ready" ? "none" : "flex";
 
     if (state === "error") {
+      setTranslationProgress(session, session.translationProgress || 0, "处理失败", false);
       if (titleNode) {
         titleNode.textContent = "译文加载失败";
       }
@@ -3375,6 +4618,12 @@
     }
     if (subtitleNode) {
       subtitleNode.textContent = "正在连接本地翻译服务，完成后会自动显示译文 PDF。";
+    }
+    if (state === "ready") {
+      setTranslationProgress(session, 100, "已完成", false);
+    }
+    else {
+      setTranslationProgress(session, session.translationProgress || 0, "准备中", true);
     }
   }
 
@@ -3404,6 +4653,7 @@
   }
 
   Zotero.FastRead = {
+    __fastReadScriptVersion: FASTREAD_READER_SCRIPT_VERSION,
     initSplitView: initSplitViewForReader,
     ensureReader,
     teardownAll,
@@ -3412,5 +4662,5 @@
     launchSplitView
   };
 
-  Zotero.debug("[fastRead] Successfully attached API to Zotero.FastRead");
+  fastReadLog("Successfully attached API to Zotero.FastRead");
 })();

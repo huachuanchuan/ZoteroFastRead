@@ -1,6 +1,7 @@
 const { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } = require("node:fs");
 const { join } = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { homedir } = require("node:os");
 
 const root = __dirname;
 const output = "fastRead-Python.xpi";
@@ -33,8 +34,11 @@ function fail(message, code = 1) {
 }
 
 function resolvePythonCommand() {
+  const windowsPython312 = process.platform === "win32"
+    ? join(process.env.USERPROFILE || homedir(), "AppData", "Local", "Programs", "Python", "Python312", "python.exe")
+    : "";
   const candidates = process.platform === "win32"
-    ? [["py", ["-3"]], ["python3", []], ["python", []]]
+    ? [[windowsPython312, []], ["py", ["-3.12"]], ["python3", []], ["python", []], ["py", ["-3"]]]
     : [["python3", []], ["python", []], ["py", ["-3"]]];
 
   for (const [command, launcherArgs] of candidates) {
@@ -136,9 +140,7 @@ function buildBundledBackend(python) {
   clearPath(pyInstallerWorkDir);
   ensureDir(pyInstallerDistDir);
   ensureDir(pyInstallerBuildDir);
-
-  const specFile = join(root, "fastread-server.spec");
-  clearPath(specFile);
+  ensureDir(join(homedir(), ".cache", "babeldoc"));
 
   const backendArtifactName = backendArtifactNameByPlatform[process.platform];
   if (!backendArtifactName) {
@@ -153,10 +155,48 @@ function buildBundledBackend(python) {
     "--onefile",
     "--name",
     "fastread-server",
+    "--specpath",
+    pyInstallerWorkDir,
     "--distpath",
     pyInstallerDistDir,
     "--workpath",
     pyInstallerBuildDir,
+    "--exclude-module",
+    "PyQt6",
+    "--exclude-module",
+    "PySide6",
+    "--exclude-module",
+    "PySide6_Essentials",
+    "--exclude-module",
+    "PySide6_Addons",
+    "--exclude-module",
+    "IPython",
+    "--exclude-module",
+    "jupyter",
+    "--exclude-module",
+    "matplotlib",
+    "--exclude-module",
+    "pandas",
+    "--exclude-module",
+    "dask",
+    "--exclude-module",
+    "xarray",
+    "--exclude-module",
+    "openpyxl",
+    "--exclude-module",
+    "h5py",
+    "--collect-all",
+    "babeldoc",
+    "--collect-all",
+    "tiktoken",
+    "--collect-all",
+    "tiktoken_ext",
+    "--collect-all",
+    "rich",
+    "--collect-all",
+    "skimage",
+    "--collect-all",
+    "sklearn",
     "server.py",
   ];
 
@@ -196,7 +236,6 @@ function buildBundledBackend(python) {
     chmodSync(targetPath, 0o755);
   }
 
-  clearPath(specFile);
   return {
     sourcePath: packageSource,
     archivePath: backendArchivePath,
@@ -290,7 +329,6 @@ const currentPlatformArchivePath = backendArchivePathByPlatform[process.platform
 if (
   currentPlatformArchivePath
   && universalRequiredArchivePaths.includes(currentPlatformArchivePath)
-  && !discoveredBackendMembers.some((member) => member.archivePath === currentPlatformArchivePath)
 ) {
   const builtCurrentPlatformMember = buildBundledBackend(python);
   discoveredBackendMembers = uniqByArchivePath([

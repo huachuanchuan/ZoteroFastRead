@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "fastRead",
-  "version": "0.2.0",
+  "version": "0.2.14",
   "description": "Moonlight-style split-view PDF translation with coordinate-mapped hover highlights for Zotero 7/8/9.",
   "icons": {
     "32": "bg.svg",
