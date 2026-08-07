@@ -2,7 +2,7 @@ Zotero的fastRead对照翻译插件
 
 # 简介：
 
-本插件是基于Babel-Doc开发的，核心特点是能够在zotero 9.x 及以下版本实现英文文献保留原排版的翻译，并且与原文对照显示（左边原文右边译文）。效果如下：
+本插件是基于Babel-Doc开发的，核心特点是能够在zotero 9.x 及以下版本实现英文文献保留原排版的翻译，并且与原文**对照显示**（左边原文右边译文），原文与译文实现**同步移动**，亦能隐藏原文显示。效果如下：
 
 ![图片 1](readme-assets/image1.jpeg)
 
@@ -20,7 +20,7 @@ Zotero的fastRead对照翻译插件
 ![图片 5](readme-assets/image5.jpeg)
 
 4. 单文件翻译
-右键要翻译的文件，选择【fastRead对照翻译】，等待结果即可。
+右键要翻译的文件，选择【fastRead对照翻译】，等待结果即可（翻译时长由文章长度、API响应速度和代码运行速度决定，一般一篇文章耗时在5分钟左右）。
 
 ![图片 6](readme-assets/image6.jpeg)
 
@@ -32,6 +32,16 @@ Zotero的fastRead对照翻译插件
 ![图片 7](readme-assets/image7.jpeg)
 
 ![图片 8](readme-assets/image8.jpeg)
+
+# 注意！！！
+如果您的电脑属于**新电脑**或者电脑中**不存在Python环境和VC++运行库**，您需要打开命令提示符（先按win+R再输入cmd进入）通过下面两条命令进行安装：
+```
+winget install Microsoft.VCRedist.2015+.x64
+```
+```
+winget install Python.Python.3.12
+```
+
 
 # 不足之处
 
